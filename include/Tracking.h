@@ -54,6 +54,14 @@ namespace ORB_SLAM3
     class System;
     class Settings;
 
+    struct PersonInstanceMotionInfo
+    {
+        cv::Mat mask;
+        cv::Rect bbox;
+        cv::Point2f center;
+        float area = 0.0f;
+    };
+
     class Tracking
     {
 
@@ -364,6 +372,11 @@ namespace ORB_SLAM3
         int initID, lastID;
 
         Sophus::SE3f mTlr;
+
+        std::vector<PersonInstanceMotionInfo> mvLastPersonInstances;
+        cv::Mat mLastPersonMotionGray;
+        cv::Mat mLastPersonCloudMask;
+        int mPersonCloudMaskMissFrames = 0;
 
         void newParameterLoader(Settings *settings);
 

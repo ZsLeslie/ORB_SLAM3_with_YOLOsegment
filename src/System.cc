@@ -537,12 +537,21 @@ namespace ORB_SLAM3
 
         mpLocalMapper->RequestFinish();
         mpLoopCloser->RequestFinish();
-        /*if(mpViewer)
+        if(mpPointCloudMapper)
+            mpPointCloudMapper->RequestFinish();
+        if(mpViewer)
         {
             mpViewer->RequestFinish();
             while(!mpViewer->isFinished())
                 usleep(5000);
-        }*/
+        }
+
+        if(mptViewer && mptViewer->joinable() && mptViewer->get_id() != std::this_thread::get_id())
+            mptViewer->join();
+
+        if(mptPointCloudMapping && mptPointCloudMapping->joinable() &&
+           mptPointCloudMapping->get_id() != std::this_thread::get_id())
+            mptPointCloudMapping->join();
 
         // Wait until all thread have effectively stopped
         /*while(!mpLocalMapper->isFinished() || !mpLoopCloser->isFinished() || mpLoopCloser->isRunningGBA())
@@ -577,6 +586,14 @@ namespace ORB_SLAM3
     {
         unique_lock<mutex> lock(mMutexReset);
         return mbShutDown;
+    }
+
+    bool System::SavePointCloudMap(const string &filename)
+    {
+        if(!mpPointCloudMapper)
+            return false;
+
+        return mpPointCloudMapper->SaveMap(filename);
     }
 
     void System::SaveTrajectoryTUM(const string &filename)

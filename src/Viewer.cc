@@ -317,6 +317,9 @@ void Viewer::Run()
 
         pangolin::FinishFrame();
 
+        if(CheckFinish())
+            break;
+
         cv::Mat toShow;
         cv::Mat im = mpFrameDrawer->DrawFrame(trackedImageScale);
 

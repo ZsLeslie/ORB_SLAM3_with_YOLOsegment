@@ -12,7 +12,8 @@ message("Build type: " ${CMAKE_BUILD_TYPE})
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  -w")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
 set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -march=native")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -march=native")
+# Keep Eigen/PCL alignment compatible with the distribution PCL binaries.
+# -O3 remains enabled by CMake's Release defaults.
 
 # Check C++11 or C++0x support
 include(CheckCXXCompilerFlag)
@@ -42,7 +43,7 @@ message(${OpenCV_VERSION})
 
 find_package(Eigen3 REQUIRED)
 find_package(Pangolin REQUIRED)
-find_package(PCL 1.10 REQUIRED)
+find_package(PCL 1.12 REQUIRED)
 
 include_directories(
         ${PROJECT_SOURCE_DIR}

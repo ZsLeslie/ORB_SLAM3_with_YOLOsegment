@@ -869,65 +869,33 @@ namespace ORB_SLAM3
                         {
                             (*vit).pt.x += j * wCell;
                             (*vit).pt.y += i * hCell;
-                            vToDistributeKeys.push_back(*vit);
-                        }
-                    }
-                    // Delete kp
-                    float scale = mvScaleFactor[level];
-                    for (auto vit = vToDistributeKeys.begin(); vit != vToDistributeKeys.end(); vit++)
-                    {
-                        vit->pt.x += minBorderX;
-                        vit->pt.y += minBorderY;
-                        vit->pt *= scale;
-                    }
 
-                    bool Find = false;
-                    for (auto vit_kp = vToDistributeKeys.begin(); vit_kp != vToDistributeKeys.end();)
-                    {
-                        for (auto vit_mask = mvDynamicArea.begin(); vit_mask != mvDynamicArea.end(); vit_mask++)
-                        {
-                            Find = false;
-                            if (*vit_mask->ptr<float>(vit_kp->pt.y, vit_kp->pt.x) > 0.5)
+                            bool isDynamic = false;
+                            if (!mvDynamicArea.empty())
                             {
-                                Find = true;
-                                vit_kp = vToDistributeKeys.erase(vit_kp);
-                                break;
+                                const float scale = mvScaleFactor[level];
+                                const int x = cvRound((vit->pt.x + minBorderX) * scale);
+                                const int y = cvRound((vit->pt.y + minBorderY) * scale);
+
+                                for (const auto &mask : mvDynamicArea)
+                                {
+                                    if (mask.empty() || mask.type() != CV_32F ||
+                                        x < 0 || x >= mask.cols || y < 0 || y >= mask.rows)
+                                    {
+                                        continue;
+                                    }
+
+                                    if (mask.at<float>(y, x) > 0.5f)
+                                    {
+                                        isDynamic = true;
+                                        break;
+                                    }
+                                }
                             }
-                        }
-                        if (!Find)
-                        {
-                            ++vit_kp;
-                            Find = false;
-                        }
-                    }
-                    // for (auto vit_kp = vToDistributeKeys.begin(); vit_kp != vToDistributeKeys.end();)
-                    // {
-                    //     for (auto vit_area = mvDynamicArea.begin();
-                    //          vit_area != mvDynamicArea.end();
-                    //          vit_area++)
-                    //     {
-                    //         Find = false;
-                    //         if (vit_area->contains(vit_kp->pt))
-                    //         {
-                    //             Find = true;
-                    //             vit_kp = vToDistributeKeys.erase(vit_kp); // 删除该点
-                    //             break;
-                    //         }
-                    //     }
 
-                    //     if (!Find)
-                    //     {
-                    //         ++vit_kp;
-                    //         Find = false;
-                    //     }
-                    // }
-
-                    float scale_inverse = 1 / scale;
-                    for (auto vit = vToDistributeKeys.begin(); vit != vToDistributeKeys.end(); vit++)
-                    {
-                        vit->pt *= scale_inverse;
-                        vit->pt.x -= minBorderX;
-                        vit->pt.y -= minBorderY;
+                            if (!isDynamic)
+                                vToDistributeKeys.push_back(*vit);
+                        }
                     }
                 }
             }

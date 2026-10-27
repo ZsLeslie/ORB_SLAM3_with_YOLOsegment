@@ -303,6 +303,7 @@ namespace ORB_SLAM3
 
         std::vector<cv::Mat> mvDynamicArea;
         cv::Mat mSemanticClsMap;
+        cv::Mat mPersonCloudMask;
 
 #ifdef REGISTER_TIMES
         double mTimeORB_Ext;

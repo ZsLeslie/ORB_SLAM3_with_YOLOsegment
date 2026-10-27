@@ -423,6 +423,7 @@ public:
 
     std::vector<cv::Mat> mvDynamicArea;
     cv::Mat mSemanticClsMap;
+    cv::Mat mPersonCloudMask;
 
     //bool mbHasHessian;
     //cv::Mat mHessianPose;

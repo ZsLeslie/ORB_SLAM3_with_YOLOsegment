@@ -91,3 +91,65 @@ my_settings.txt
 borrar/*
 
 */ExecMean.txt
+
+# CMake / compiler outputs (including in-source builds)
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.d
+*.gch
+*.pch
+
+# Test outputs, logs and temporary files (keep test source code)
+Testing/
+test-results/
+test-output/
+__pycache__/
+.pytest_cache/
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.gcda
+*.gcno
+*.gcov
+/groundtruth.txt
+
+# Images captured or generated during experiments
+*.[pP][nN][gG]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[bB][mM][pP]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[pP][gG][mM]
+*.[pP][pP][mM]
+*.[pP][nN][mM]
+*.[eE][xX][rR]
+
+# Point cloud data
+*.[pP][cC][dD]
+*.[pP][lL][yY]
+*.[xX][yY][zZ]
+*.[lL][aA][sS]
+*.[lL][aA][zZ]
+
+# Generated TensorRT engines
+*.engine

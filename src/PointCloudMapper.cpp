@@ -1,5 +1,9 @@
 #include "PointCloudMapper.h"
 
+#include <chrono>
+#include <cmath>
+#include <thread>
+
 typedef pcl::PointXYZRGB PointT;
 typedef pcl::PointCloud<PointT> PointCloud;
 
@@ -27,12 +31,6 @@ static cv::Vec3b GetSemanticColor(int classId)
 PointCloudMapper::PointCloudMapper()
 {
     mpGlobalMap = pcl::make_shared<PointCloud>();
-    cout << "voxel set start" << endl;
-    mpVoxel = pcl::make_shared<pcl::VoxelGrid<PointT>>();
-    mpStatistic = pcl::make_shared<pcl::StatisticalOutlierRemoval<PointT>>();
-    mpVoxel->setLeafSize(0.01, 0.01, 0.01);
-    mpStatistic->setMeanK(100);
-    cout << "voxel set finish" << endl;
 }
 
 void PointCloudMapper::InsertKeyFrame(KeyFrame *kf, cv::Mat &imRGB, cv::Mat &imDepth)
@@ -52,27 +50,48 @@ PointCloud::Ptr PointCloudMapper::GeneratePointCloud(KeyFrame *kf, cv::Mat &imRG
         for (int u = 0; u < imRGB.cols; u += 3)
         {
             cv::Point2i pt(u, v);
+
+            int cls_id = -1;
+            if (!kf->mSemanticClsMap.empty() && kf->mSemanticClsMap.type() == CV_32S &&
+                u < kf->mSemanticClsMap.cols && v < kf->mSemanticClsMap.rows)
+            {
+                cls_id = kf->mSemanticClsMap.at<int>(v, u);
+            }
+
+            const bool isPersonCloudPoint =
+                (!kf->mPersonCloudMask.empty() && kf->mPersonCloudMask.type() == CV_8U &&
+                 u < kf->mPersonCloudMask.cols && v < kf->mPersonCloudMask.rows &&
+                 kf->mPersonCloudMask.at<uchar>(v, u) > 0) ||
+                cls_id == 0;
+
+            // Feature extraction only rejects moving people. Dense mapping uses a
+            // closed, filled and dilated mask for every detected person.
+            if (isPersonCloudPoint)
+            {
+                ++mRejectedPersonPoints;
+                continue;
+            }
+
             bool IsDynamic = false;
             for (auto area : kf->mvDynamicArea)
             {
-                if (*area.ptr<float>(pt.y, pt.x) > 0.1)
+                if (!area.empty() && area.type() == CV_32F &&
+                    pt.x >= 0 && pt.x < area.cols && pt.y >= 0 && pt.y < area.rows &&
+                    area.at<float>(pt.y, pt.x) > 0.1f)
+                {
                     IsDynamic = true;
+                    break;
+                }
             }
             if (!IsDynamic)
             {
                 float d = imDepth.ptr<float>(v)[u];
-                if (d < 0.0)
+                if (d <= 0.0f || !std::isfinite(d))
                     continue;
                 PointT p;
                 p.z = d;
                 p.x = (u - kf->cx) * p.z / kf->fx;
                 p.y = (v - kf->cy) * p.z / kf->fy;
-
-                int cls_id = -1;
-                if (!kf->mSemanticClsMap.empty())
-                {
-                    cls_id = kf->mSemanticClsMap.at<int>(v, u);
-                }
 
                 if (cls_id >= 0)
                 {
@@ -101,11 +120,10 @@ PointCloud::Ptr PointCloudMapper::GeneratePointCloud(KeyFrame *kf, cv::Mat &imRG
 
 void PointCloudMapper::run()
 {
-    pcl::visualization::CloudViewer Viewer("Viewer");
     cout << endl
          << "PointCloudMapping thread start!" << endl;
     int ID = 0;
-    while (1)
+    while (true)
     {
         KeyFrame *kf = nullptr;
         cv::Mat rgb, depth;
@@ -127,14 +145,87 @@ void PointCloudMapper::run()
             PointCloud::Ptr pointCloud_new = GeneratePointCloud(kf, rgb, depth);
 
             ID++;
-            PointCloud::Ptr new_filtered(new PointCloud);
-            mpVoxel->setInputCloud(pointCloud_new);
-            mpVoxel->filter(*new_filtered);
-            mpStatistic->setInputCloud(new_filtered);
-            mpStatistic->filter(*new_filtered);
-            *mpGlobalMap += *new_filtered;
+            *mpGlobalMap += *pointCloud_new;
+            continue;
         }
 
-        Viewer.showCloud(mpGlobalMap);
+        if (mbFinishRequested.load())
+            break;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+
+    mbFinished.store(true);
+    cout << "PointCloudMapping thread finished with " << mpGlobalMap->size()
+         << " points from " << ID << " keyframes; rejected "
+         << mRejectedPersonPoints << " person-mask samples." << endl;
+}
+
+void PointCloudMapper::RequestFinish()
+{
+    mbFinishRequested.store(true);
+}
+
+bool PointCloudMapper::SaveMap(const std::string &filename) const
+{
+    if (!mbFinished.load())
+    {
+        cerr << "Cannot save point cloud before the mapping thread has finished." << endl;
+        return false;
+    }
+
+    if (!mpGlobalMap || mpGlobalMap->empty())
+    {
+        cerr << "Cannot save an empty point cloud map." << endl;
+        return false;
+    }
+
+    PointCloud voxelFiltered;
+    PointCloud statisticalFiltered;
+
+    try
+    {
+        pcl::VoxelGrid<PointT> voxelFilter;
+        voxelFilter.setLeafSize(0.01f, 0.01f, 0.01f);
+        voxelFilter.setInputCloud(mpGlobalMap);
+        voxelFilter.filter(voxelFiltered);
+        cout << "Voxel filtering: " << mpGlobalMap->size() << " -> "
+             << voxelFiltered.size() << " points." << endl;
+
+        if (voxelFiltered.empty())
+        {
+            cerr << "Voxel filtering produced an empty point cloud." << endl;
+            return false;
+        }
+
+        pcl::StatisticalOutlierRemoval<PointT> statisticalFilter;
+        statisticalFilter.setMeanK(100);
+        statisticalFilter.setStddevMulThresh(1.0);
+        statisticalFilter.setInputCloud(voxelFiltered.makeShared());
+        statisticalFilter.filter(statisticalFiltered);
+        cout << "Statistical filtering: " << voxelFiltered.size() << " -> "
+             << statisticalFiltered.size() << " points." << endl;
+    }
+    catch (const std::exception &e)
+    {
+        cerr << "Point cloud filtering failed: " << e.what() << endl;
+        return false;
+    }
+
+    if (statisticalFiltered.empty())
+    {
+        cerr << "Statistical filtering produced an empty point cloud." << endl;
+        return false;
+    }
+
+    const int result = pcl::io::savePCDFileBinary(filename, statisticalFiltered);
+    if (result < 0)
+    {
+        cerr << "Failed to save point cloud map to " << filename << endl;
+        return false;
+    }
+
+    cout << "Point cloud map saved to " << filename << " ("
+         << statisticalFiltered.size() << " filtered points)." << endl;
+    return true;
 }

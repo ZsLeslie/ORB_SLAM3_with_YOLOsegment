@@ -152,6 +152,9 @@ namespace ORB_SLAM3
         // See format details at: http://vision.in.tum.de/data/datasets/rgbd-dataset
         void SaveKeyFrameTrajectoryTUM(const string &filename);
 
+        // Save the dense RGB-D point cloud. Call first Shutdown().
+        bool SavePointCloudMap(const string &filename);
+
         void SaveTrajectoryEuRoC(const string &filename);
         void SaveKeyFrameTrajectoryEuRoC(const string &filename);
 

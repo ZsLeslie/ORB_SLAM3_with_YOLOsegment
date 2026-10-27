@@ -2,14 +2,13 @@
 #define ORB_SLAM3_POINTCLOUDMAPPER_H
 #include <iostream>
 #include <fstream>
+#include <atomic>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <Eigen/Geometry>
 #include <boost/format.hpp>
 #include <pcl/point_types.h>
 #include <pcl/io/pcd_io.h>
-#include <pcl/visualization/pcl_visualizer.h>
-#include <pcl/visualization/cloud_viewer.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/statistical_outlier_removal.h>
 #include "KeyFrame.h"
@@ -31,15 +30,21 @@ public:
 
     void run();
 
+    void RequestFinish();
+
+    bool SaveMap(const std::string& filename) const;
+
     queue<KeyFrame*> mqKeyFrame;
     queue<cv::Mat> mqRGB;
     queue<cv::Mat> mqDepth;
 
-    pcl::VoxelGrid<PointT>::Ptr mpVoxel;
-    pcl::StatisticalOutlierRemoval<PointT>::Ptr mpStatistic;
     std::mutex mmLoadKFMutex;
     PointCloud::Ptr mpGlobalMap;
     int mKeyFrameSize;
+    std::size_t mRejectedPersonPoints{0};
+
+    std::atomic<bool> mbFinishRequested{false};
+    std::atomic<bool> mbFinished{false};
 
 
 };

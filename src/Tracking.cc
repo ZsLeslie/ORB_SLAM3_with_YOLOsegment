@@ -32,11 +32,269 @@
 
 #include <mutex>
 #include <chrono>
+#include <limits>
+
+#include <opencv2/calib3d.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/video/tracking.hpp>
 
 using namespace std;
 
 namespace ORB_SLAM3
 {
+    namespace
+    {
+        const int kMinBackgroundTracks = 40;
+        const int kMinPersonTracks = 8;
+        const float kPersonMatchMaxCenterDistRatio = 0.75f;
+        const float kMovingResidualPx = 3.0f;
+        const float kMovingResidualRatio = 0.25f;
+        const float kMovingCenterResidualPx = 6.0f;
+        const int kPersonCloudMaskMaxMissFrames = 2;
+
+        cv::Point2f RectCenter(const cv::Rect &rect)
+        {
+            return cv::Point2f(rect.x + 0.5f * rect.width, rect.y + 0.5f * rect.height);
+        }
+
+        float RectIoU(const cv::Rect &a, const cv::Rect &b)
+        {
+            const cv::Rect inter = a & b;
+            const float interArea = static_cast<float>(inter.area());
+            const float unionArea = static_cast<float>(a.area() + b.area()) - interArea;
+            return unionArea > 0.0f ? interArea / unionArea : 0.0f;
+        }
+
+        cv::Point2f TransformPointByAffine(const cv::Point2f &pt, const cv::Mat &affine)
+        {
+            const double *a = affine.ptr<double>(0);
+            return cv::Point2f(
+                static_cast<float>(a[0] * pt.x + a[1] * pt.y + a[2]),
+                static_cast<float>(a[3] * pt.x + a[4] * pt.y + a[5]));
+        }
+
+        cv::Mat BuildPersonUnionMask(const std::vector<PersonInstanceMotionInfo> &persons,
+                                     const cv::Size &imageSize)
+        {
+            cv::Mat unionMask(imageSize, CV_8U, cv::Scalar(0));
+            for (const auto &person : persons)
+            {
+                if (!person.mask.empty() && person.mask.size() == imageSize)
+                    cv::bitwise_or(unionMask, person.mask, unionMask);
+            }
+            return unionMask;
+        }
+
+        cv::Mat BuildPersonCloudMask(const std::vector<PersonInstanceMotionInfo> &persons,
+                                     const cv::Mat &depth, const cv::Size &imageSize)
+        {
+            cv::Mat personMask = BuildPersonUnionMask(persons, imageSize);
+            if (persons.empty() || depth.empty() || depth.type() != CV_32F)
+                return personMask;
+
+            const cv::Rect imageRect(0, 0, imageSize.width, imageSize.height);
+            for (const auto &person : persons)
+            {
+                const cv::Rect personRoi = person.bbox & imageRect;
+                if (person.mask.empty() || personRoi.empty())
+                    continue;
+
+                std::vector<float> personDepths;
+                personDepths.reserve(static_cast<size_t>(person.area));
+                for (int y = personRoi.y; y < personRoi.y + personRoi.height; y += 2)
+                {
+                    const uchar *maskPtr = person.mask.ptr<uchar>(y);
+                    const float *depthPtr = depth.ptr<float>(y);
+                    for (int x = personRoi.x; x < personRoi.x + personRoi.width; x += 2)
+                    {
+                        const float d = depthPtr[x];
+                        if (maskPtr[x] > 0 && d > 0.0f && std::isfinite(d))
+                            personDepths.push_back(d);
+                    }
+                }
+
+                if (personDepths.size() < 30)
+                    continue;
+
+                std::sort(personDepths.begin(), personDepths.end());
+                const float nearDepth = personDepths[personDepths.size() / 20];
+                const float medianDepth = personDepths[personDepths.size() / 2];
+                const float farDepth = personDepths[personDepths.size() * 19 / 20];
+                const float depthMargin = std::max(0.20f, 0.08f * medianDepth);
+
+                const int padding = std::max(12, cvRound(0.08f *
+                    static_cast<float>(std::max(personRoi.width, personRoi.height))));
+                const cv::Rect expandedRoi(personRoi.x - padding, personRoi.y - padding,
+                                           personRoi.width + 2 * padding,
+                                           personRoi.height + 2 * padding);
+                const cv::Rect clippedRoi = expandedRoi & imageRect;
+
+                for (int y = clippedRoi.y; y < clippedRoi.y + clippedRoi.height; ++y)
+                {
+                    const float *depthPtr = depth.ptr<float>(y);
+                    uchar *personPtr = personMask.ptr<uchar>(y);
+                    for (int x = clippedRoi.x; x < clippedRoi.x + clippedRoi.width; ++x)
+                    {
+                        const float d = depthPtr[x];
+                        if (d > 0.0f && std::isfinite(d) &&
+                            d >= nearDepth - depthMargin && d <= farDepth + depthMargin)
+                        {
+                            personPtr[x] = 255;
+                        }
+                    }
+                }
+            }
+
+            const cv::Mat closeKernel =
+                cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(11, 11));
+            cv::morphologyEx(personMask, personMask, cv::MORPH_CLOSE, closeKernel);
+
+            std::vector<std::vector<cv::Point>> personContours;
+            cv::findContours(personMask.clone(), personContours,
+                             cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+            personMask.setTo(0);
+            cv::drawContours(personMask, personContours, -1, cv::Scalar(255), cv::FILLED);
+
+            const cv::Mat dilateKernel =
+                cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(21, 21));
+            cv::dilate(personMask, personMask, dilateKernel);
+            return personMask;
+        }
+
+        std::vector<cv::Point2f> SampleMaskPoints(const cv::Mat &mask, const cv::Rect &bbox, const int step)
+        {
+            std::vector<cv::Point2f> points;
+            if (mask.empty() || bbox.empty())
+                return points;
+
+            const cv::Rect imageRect(0, 0, mask.cols, mask.rows);
+            const cv::Rect roi = bbox & imageRect;
+            points.reserve(std::max(16, roi.area() / (step * step)));
+
+            for (int y = roi.y; y < roi.y + roi.height; y += step)
+            {
+                const uchar *maskPtr = mask.ptr<uchar>(y);
+                for (int x = roi.x; x < roi.x + roi.width; x += step)
+                {
+                    if (maskPtr[x] > 0)
+                        points.emplace_back(static_cast<float>(x), static_cast<float>(y));
+                }
+            }
+            return points;
+        }
+
+        bool EstimateBackgroundAffine(const cv::Mat &lastGray, const cv::Mat &currentGray,
+                                      const cv::Mat &lastPersonMask, const cv::Mat &currentPersonMask,
+                                      cv::Mat &affine)
+        {
+            affine = cv::Mat();
+            if (lastGray.empty() || currentGray.empty() || lastGray.size() != currentGray.size())
+                return false;
+
+            cv::Mat backgroundMask(lastGray.size(), CV_8U, cv::Scalar(255));
+            if (!lastPersonMask.empty())
+                backgroundMask.setTo(0, lastPersonMask);
+            if (!currentPersonMask.empty())
+                backgroundMask.setTo(0, currentPersonMask);
+
+            std::vector<cv::Point2f> ptsLast;
+            cv::goodFeaturesToTrack(lastGray, ptsLast, 600, 0.01, 12.0, backgroundMask, 3, false, 0.04);
+            if (ptsLast.size() < kMinBackgroundTracks)
+                return false;
+
+            std::vector<cv::Point2f> ptsCurrent;
+            std::vector<uchar> status;
+            std::vector<float> err;
+            cv::calcOpticalFlowPyrLK(lastGray, currentGray, ptsLast, ptsCurrent, status, err,
+                                     cv::Size(21, 21), 3);
+
+            std::vector<cv::Point2f> inLast;
+            std::vector<cv::Point2f> inCurrent;
+            inLast.reserve(ptsLast.size());
+            inCurrent.reserve(ptsCurrent.size());
+            for (size_t i = 0; i < status.size(); ++i)
+            {
+                if (status[i])
+                {
+                    inLast.push_back(ptsLast[i]);
+                    inCurrent.push_back(ptsCurrent[i]);
+                }
+            }
+
+            if (inLast.size() < kMinBackgroundTracks)
+                return false;
+
+            affine = cv::estimateAffinePartial2D(inLast, inCurrent, cv::noArray(), cv::RANSAC, 3.0);
+            if (!affine.empty() && affine.type() != CV_64F)
+                affine.convertTo(affine, CV_64F);
+            return !affine.empty();
+        }
+
+        int MatchPreviousPerson(const PersonInstanceMotionInfo &currentPerson,
+                                const std::vector<PersonInstanceMotionInfo> &lastPersons)
+        {
+            int bestIdx = -1;
+            float bestScore = std::numeric_limits<float>::max();
+            const float maxDist = kPersonMatchMaxCenterDistRatio *
+                                  std::max(currentPerson.bbox.width, currentPerson.bbox.height);
+
+            for (size_t i = 0; i < lastPersons.size(); ++i)
+            {
+                const float iou = RectIoU(currentPerson.bbox, lastPersons[i].bbox);
+                const float dist = cv::norm(currentPerson.center - lastPersons[i].center);
+                if (iou <= 0.02f && dist > maxDist)
+                    continue;
+
+                const float score = dist - 80.0f * iou;
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    bestIdx = static_cast<int>(i);
+                }
+            }
+            return bestIdx;
+        }
+
+        bool IsPersonMovingByFlow(const cv::Mat &lastGray, const cv::Mat &currentGray, const cv::Mat &backgroundAffine,
+                                  const PersonInstanceMotionInfo &lastPerson)
+        {
+            if (backgroundAffine.empty() || lastPerson.mask.empty())
+                return false;
+
+            std::vector<cv::Point2f> ptsLast = SampleMaskPoints(lastPerson.mask, lastPerson.bbox, 8);
+            if (ptsLast.size() < kMinPersonTracks)
+                return false;
+
+            std::vector<cv::Point2f> ptsCurrent;
+            std::vector<uchar> status;
+            std::vector<float> err;
+            cv::calcOpticalFlowPyrLK(lastGray, currentGray, ptsLast, ptsCurrent, status, err,
+                                     cv::Size(21, 21), 3);
+
+            std::vector<float> residuals;
+            residuals.reserve(ptsLast.size());
+            int movingCount = 0;
+            for (size_t i = 0; i < status.size(); ++i)
+            {
+                if (!status[i])
+                    continue;
+
+                const cv::Point2f predicted = TransformPointByAffine(ptsLast[i], backgroundAffine);
+                const float residual = cv::norm(ptsCurrent[i] - predicted);
+                residuals.push_back(residual);
+                if (residual > kMovingResidualPx)
+                    ++movingCount;
+            }
+
+            if (residuals.size() < kMinPersonTracks)
+                return false;
+
+            std::nth_element(residuals.begin(), residuals.begin() + residuals.size() / 2, residuals.end());
+            const float medianResidual = residuals[residuals.size() / 2];
+            const float movingRatio = static_cast<float>(movingCount) / static_cast<float>(residuals.size());
+            return medianResidual > kMovingResidualPx || movingRatio > kMovingResidualRatio;
+        }
+    }
 
     Tracking::Tracking(System *pSys, ORBVocabulary *pVoc, FrameDrawer *pFrameDrawer, MapDrawer *pMapDrawer, Atlas *pAtlas, KeyFrameDatabase *pKFDB, const string &strSettingPath, const int sensor, Settings *settings, const string &_nameSeq) : mState(NO_IMAGES_YET), mSensor(sensor), mTrackedFr(0), mbStep(false),
                                                                                                                                                                                                                                                   mbOnlyTracking(false), mbMapUpdated(false), mbVO(false), mpORBVocabulary(pVoc), mpKeyFrameDB(pKFDB),
@@ -1551,8 +1809,21 @@ namespace ORB_SLAM3
         mImColor = imRGB.clone();
         cv::Mat imDepth = imD;
 
+        if ((fabs(mDepthMapFactor - 1.0f) > 1e-5) || imDepth.type() != CV_32F)
+            imDepth.convertTo(imDepth, CV_32F, mDepthMapFactor);
+
         cv::Mat img = imRGB.clone();
         std::vector<cv::Mat> mvDynamicArea;
+        std::vector<PersonInstanceMotionInfo> vCurrentPersonInstances;
+
+        cv::Mat currentMotionGray;
+        if (img.channels() == 3)
+            cv::cvtColor(img, currentMotionGray, mbRGB ? cv::COLOR_RGB2GRAY : cv::COLOR_BGR2GRAY);
+        else if (img.channels() == 4)
+            cv::cvtColor(img, currentMotionGray, mbRGB ? cv::COLOR_RGBA2GRAY : cv::COLOR_BGRA2GRAY);
+        else
+            currentMotionGray = img.clone();
+
         std::vector<Detection> res = mpYoloDetector->inference(img);
 
         std::vector<FrameDrawer::SegVisObject> vSegVisObjects;
@@ -1605,7 +1876,9 @@ namespace ORB_SLAM3
                 {
                     if (mask_ptr[x] > 0.5f)
                     {
-                        if (conf > conf_ptr[x])
+                        // Person pixels take precedence when instance masks overlap so
+                        // the dense mapper never keeps them as another semantic class.
+                        if (cls_id == 0 || (cls_ptr[x] != 0 && conf > conf_ptr[x]))
                         {
                             cls_ptr[x] = cls_id;
                             conf_ptr[x] = conf;
@@ -1616,19 +1889,96 @@ namespace ORB_SLAM3
 
             if (vClassNames[cls_id] == "person")
             {
-                cv::Mat mask_bin, mask_u8, mask_dilate;
+                cv::Mat mask_bin, mask_u8;
                 cv::threshold(mask_clone, mask_bin, 0.5, 1.0, cv::THRESH_BINARY);
                 mask_bin.convertTo(mask_u8, CV_8U, 255.0);
 
-                cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9));
-                cv::dilate(mask_u8, mask_dilate, kernel);
+                PersonInstanceMotionInfo personInfo;
+                personInfo.mask = mask_u8.clone();
+                personInfo.bbox = visObj.bbox;
+                personInfo.center = visObj.bbox.empty() ? RectCenter(cv::boundingRect(mask_u8)) : RectCenter(visObj.bbox);
+                personInfo.area = static_cast<float>(cv::countNonZero(mask_u8));
+
+                if (personInfo.area > 0.0f && !personInfo.bbox.empty())
+                    vCurrentPersonInstances.push_back(personInfo);
+            }
+        }
+
+        cv::Mat lastPersonUnion = BuildPersonUnionMask(mvLastPersonInstances, currentMotionGray.size());
+        cv::Mat currentPersonUnion = BuildPersonUnionMask(vCurrentPersonInstances, currentMotionGray.size());
+
+        cv::Mat backgroundAffine;
+        const bool hasBackgroundMotion = EstimateBackgroundAffine(mLastPersonMotionGray, currentMotionGray,
+                                                                  lastPersonUnion, currentPersonUnion,
+                                                                  backgroundAffine);
+
+        cv::Mat personCloudMask = BuildPersonCloudMask(vCurrentPersonInstances, imDepth, currentMotionGray.size());
+        bool propagatedPersonCloudMask = false;
+        if (vCurrentPersonInstances.empty() && !mLastPersonCloudMask.empty() && hasBackgroundMotion &&
+            mPersonCloudMaskMissFrames < kPersonCloudMaskMaxMissFrames)
+        {
+            cv::warpAffine(mLastPersonCloudMask, personCloudMask, backgroundAffine,
+                           currentMotionGray.size(), cv::INTER_NEAREST,
+                           cv::BORDER_CONSTANT, cv::Scalar(0));
+            propagatedPersonCloudMask = cv::countNonZero(personCloudMask) > 0;
+        }
+
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9));
+        for (const auto &currentPerson : vCurrentPersonInstances)
+        {
+            bool isMoving = false;
+            if (hasBackgroundMotion)
+            {
+                const int lastIdx = MatchPreviousPerson(currentPerson, mvLastPersonInstances);
+                if (lastIdx >= 0)
+                {
+                    const cv::Point2f predictedCenter =
+                        TransformPointByAffine(mvLastPersonInstances[lastIdx].center, backgroundAffine);
+                    const float centerResidual = cv::norm(currentPerson.center - predictedCenter);
+                    isMoving = centerResidual > kMovingCenterResidualPx ||
+                               IsPersonMovingByFlow(mLastPersonMotionGray, currentMotionGray, backgroundAffine,
+                                                    mvLastPersonInstances[lastIdx]);
+                }
+                else
+                {
+                    isMoving = true;
+                }
+            }
+            else if (!mLastPersonMotionGray.empty())
+            {
+                isMoving = true;
+            }
+
+            if (isMoving)
+            {
+                cv::Mat mask_dilate;
+                cv::dilate(currentPerson.mask, mask_dilate, kernel);
 
                 cv::Mat mask_final;
                 mask_dilate.convertTo(mask_final, CV_32F, 1.0 / 255.0);
-
                 mvDynamicArea.push_back(mask_final.clone());
             }
         }
+
+        mvLastPersonInstances = vCurrentPersonInstances;
+        mLastPersonMotionGray = currentMotionGray.clone();
+
+        if (!vCurrentPersonInstances.empty())
+        {
+            mLastPersonCloudMask = personCloudMask.clone();
+            mPersonCloudMaskMissFrames = 0;
+        }
+        else if (propagatedPersonCloudMask)
+        {
+            mLastPersonCloudMask = personCloudMask.clone();
+            ++mPersonCloudMaskMissFrames;
+        }
+        else
+        {
+            mLastPersonCloudMask.release();
+            mPersonCloudMaskMissFrames = 0;
+        }
+
         mpORBextractorLeft->mvDynamicArea = mvDynamicArea;
 
         if (mImGray.channels() == 3)
@@ -1646,9 +1996,6 @@ namespace ORB_SLAM3
                 cvtColor(mImGray, mImGray, cv::COLOR_BGRA2GRAY);
         }
 
-        if ((fabs(mDepthMapFactor - 1.0f) > 1e-5) || imDepth.type() != CV_32F)
-            imDepth.convertTo(imDepth, CV_32F, mDepthMapFactor);
-
         mDepth = imDepth.clone();
 
         if (mSensor == System::RGBD)
@@ -1661,6 +2008,7 @@ namespace ORB_SLAM3
             mCurrentFrame.mvDynamicArea.push_back(m.clone());
 
         mCurrentFrame.mSemanticClsMap = semanticClassMap.clone();
+        mCurrentFrame.mPersonCloudMask = personCloudMask.clone();
         mvDynamicArea.clear();
 
         mCurrentFrame.mNameFile = filename;
@@ -3441,6 +3789,7 @@ namespace ORB_SLAM3
             pKF->mvDynamicArea.push_back(m.clone());
 
         pKF->mSemanticClsMap = mCurrentFrame.mSemanticClsMap.clone();
+        pKF->mPersonCloudMask = mCurrentFrame.mPersonCloudMask.clone();
 
         mpLocalMapper->InsertKeyFrame(pKF);
 
