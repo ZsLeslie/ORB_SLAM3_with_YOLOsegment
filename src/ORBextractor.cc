@@ -57,6 +57,9 @@
 #include <opencv2/imgproc/imgproc.hpp>
 #include <vector>
 #include <iostream>
+#include <chrono>
+#include <algorithm>
+#include <stdexcept>
 
 #include "ORBextractor.h"
 
@@ -784,9 +787,95 @@ namespace ORB_SLAM3
         return vResultKeys;
     }
 
+    void ORBextractor::ConfigureAdaptive(const AdaptiveConfig &config)
+    {
+        if (config.minStaticPerCell < 1 || config.maxFeatures < 1 ||
+            (config.quotaEnabled && config.maxFeatures < nfeatures) ||
+            !std::isfinite(config.dynamicAlpha) || config.dynamicAlpha < 0.0 ||
+            !std::isfinite(config.feedbackFastGain) || config.feedbackFastGain < 0.0 ||
+            !std::isfinite(config.feedbackQuotaGain) || config.feedbackQuotaGain < 0.0)
+            throw std::invalid_argument("Invalid adaptive ORB parameters (Nmax must be >= N0)");
+        mAdaptiveConfig = config;
+    }
+
+    void ORBextractor::SetCompensationStrength(double strength)
+    {
+        mCompensationStrength = std::isfinite(strength) ?
+            std::max(0.0, std::min(1.0, strength)) : 0.0;
+    }
+
+    bool ORBextractor::IsDynamicCandidate(const cv::Point2f &point, int level) const
+    {
+        // Point is in pyramid image coordinates, including the extraction border.
+        const int x = cvRound(point.x * mvScaleFactor[level]);
+        const int y = cvRound(point.y * mvScaleFactor[level]);
+        for (const auto &mask : mvDynamicArea)
+        {
+            if (mask.empty() || mask.type() != CV_32F ||
+                x < 0 || x >= mask.cols || y < 0 || y >= mask.rows)
+                continue;
+            if (mask.at<float>(y, x) > 0.5f)
+                return true;
+        }
+        return false;
+    }
+
+    std::vector<int> ORBextractor::ComputeFrameQuotas()
+    {
+        std::vector<int> quotas = mnFeaturesPerLevel;
+        mAdaptiveStats.targetFeatures = nfeatures;
+        if (mAdaptiveConfig.quotaEnabled || mAdaptiveConfig.statsEnabled)
+        {
+            const cv::Size size = mvImagePyramid[0].size();
+            cv::Mat unionMask(size, CV_8U, cv::Scalar(0));
+            for (const auto &mask : mvDynamicArea)
+            {
+                if (mask.empty() || mask.type() != CV_32F)
+                    continue;
+                const cv::Rect roi(0, 0, std::min(size.width, mask.cols),
+                                   std::min(size.height, mask.rows));
+                cv::Mat binary;
+                cv::compare(mask(roi), 0.5, binary, cv::CMP_GT);
+                cv::bitwise_or(unionMask(roi), binary, unionMask(roi));
+            }
+            mAdaptiveStats.dynamicRatio = static_cast<double>(cv::countNonZero(unionMask)) /
+                                          static_cast<double>(unionMask.total());
+        }
+        if (mAdaptiveConfig.quotaEnabled)
+        {
+            const double desired = nfeatures * (1.0 + mAdaptiveConfig.dynamicAlpha *
+                mAdaptiveStats.dynamicRatio + mAdaptiveConfig.feedbackQuotaGain * mCompensationStrength);
+            const int target = cvRound(std::min(static_cast<double>(mAdaptiveConfig.maxFeatures), desired));
+            mAdaptiveStats.targetFeatures = target;
+            // Retain original quotas exactly when no boost is requested. Otherwise use
+            // cumulative rounding of geometric weights, with an exact total of target.
+            if (target != nfeatures)
+            {
+                double weightSum = 0.0;
+                for (float weight : mvInvScaleFactor) weightSum += weight;
+                double cumulative = 0.0;
+                int assigned = 0;
+                for (int level = 0; level < nlevels; ++level)
+                {
+                    cumulative += mvInvScaleFactor[level];
+                    const int end = level == nlevels - 1 ? target : cvRound(target * cumulative / weightSum);
+                    quotas[level] = end - assigned;
+                    assigned = end;
+                }
+            }
+        }
+        mAdaptiveStats.levelQuotas = quotas;
+        return quotas;
+    }
+
     void ORBextractor::ComputeKeyPointsOctTree(vector<vector<KeyPoint>> &allKeypoints)
     {
         allKeypoints.resize(nlevels);
+        const auto quotaStart = std::chrono::steady_clock::now();
+        const std::vector<int> frameQuotas = ComputeFrameQuotas();
+        if (mAdaptiveConfig.statsEnabled)
+            mAdaptiveStats.compensationMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - quotaStart).count();
 
         const float W = 35;
 
@@ -803,8 +892,10 @@ namespace ORB_SLAM3
             const float width = (maxBorderX - minBorderX);
             const float height = (maxBorderY - minBorderY);
 
-            const int nCols = width / W;
-            const int nRows = height / W;
+            if (width <= 6 || height <= 6)
+                continue;
+            const int nCols = std::max(1, static_cast<int>(width / W));
+            const int nRows = std::max(1, static_cast<int>(height / W));
             const int wCell = ceil(width / nCols);
             const int hCell = ceil(height / nRows);
 
@@ -832,79 +923,68 @@ namespace ORB_SLAM3
                     FAST(mvImagePyramid[level].rowRange(iniY, maxY).colRange(iniX, maxX),
                          vKeysCell, iniThFAST, true);
 
-                    /*if(bRight && j <= 13){
-                        FAST(mvImagePyramid[level].rowRange(iniY,maxY).colRange(iniX,maxX),
-                             vKeysCell,10,true);
-                    }
-                    else if(!bRight && j >= 16){
-                        FAST(mvImagePyramid[level].rowRange(iniY,maxY).colRange(iniX,maxX),
-                             vKeysCell,10,true);
-                    }
-                    else{
-                        FAST(mvImagePyramid[level].rowRange(iniY,maxY).colRange(iniX,maxX),
-                             vKeysCell,iniThFAST,true);
-                    }*/
-
+                    // Preserve the legacy empty-cell fallback, even with compensation off.
+                    bool usedLowThreshold = false;
                     if (vKeysCell.empty())
                     {
                         FAST(mvImagePyramid[level].rowRange(iniY, maxY).colRange(iniX, maxX),
                              vKeysCell, minThFAST, true);
-                        /*if(bRight && j <= 13){
-                            FAST(mvImagePyramid[level].rowRange(iniY,maxY).colRange(iniX,maxX),
-                                 vKeysCell,5,true);
-                        }
-                        else if(!bRight && j >= 16){
-                            FAST(mvImagePyramid[level].rowRange(iniY,maxY).colRange(iniX,maxX),
-                                 vKeysCell,5,true);
-                        }
-                        else{
-                            FAST(mvImagePyramid[level].rowRange(iniY,maxY).colRange(iniX,maxX),
-                                 vKeysCell,minThFAST,true);
-                        }*/
+                        usedLowThreshold = true;
                     }
 
-                    if (!vKeysCell.empty())
+                    vector<cv::KeyPoint> staticCell;
+                    const auto appendStatic = [&](const vector<cv::KeyPoint> &detected,
+                                                  bool deduplicate)
                     {
-                        for (vector<cv::KeyPoint>::iterator vit = vKeysCell.begin(); vit != vKeysCell.end(); vit++)
+                        for (auto key : detected)
                         {
-                            (*vit).pt.x += j * wCell;
-                            (*vit).pt.y += i * hCell;
-
-                            bool isDynamic = false;
-                            if (!mvDynamicArea.empty())
-                            {
-                                const float scale = mvScaleFactor[level];
-                                const int x = cvRound((vit->pt.x + minBorderX) * scale);
-                                const int y = cvRound((vit->pt.y + minBorderY) * scale);
-
-                                for (const auto &mask : mvDynamicArea)
-                                {
-                                    if (mask.empty() || mask.type() != CV_32F ||
-                                        x < 0 || x >= mask.cols || y < 0 || y >= mask.rows)
-                                    {
-                                        continue;
-                                    }
-
-                                    if (mask.at<float>(y, x) > 0.5f)
-                                    {
-                                        isDynamic = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if (!isDynamic)
-                                vToDistributeKeys.push_back(*vit);
+                            key.pt.x += j * wCell;
+                            key.pt.y += i * hCell;
+                            if (IsDynamicCandidate(key.pt + cv::Point2f(minBorderX, minBorderY), level))
+                                continue;
+                            if (deduplicate && std::any_of(staticCell.begin(), staticCell.end(),
+                                [&](const cv::KeyPoint &old) { return old.pt == key.pt; }))
+                                continue;
+                            staticCell.push_back(key);
                         }
+                    };
+                    appendStatic(vKeysCell, false);
+                    mAdaptiveStats.staticBefore += staticCell.size();
+
+                    const double required = mAdaptiveConfig.minStaticPerCell *
+                        (1.0 + mAdaptiveConfig.feedbackFastGain * mCompensationStrength);
+                    if (mAdaptiveConfig.fastEnabled && !usedLowThreshold && minThFAST < iniThFAST &&
+                        staticCell.size() < required)
+                    {
+                        const auto extraStart = std::chrono::steady_clock::now();
+                        vector<cv::KeyPoint> extra;
+                        FAST(mvImagePyramid[level].rowRange(iniY, maxY).colRange(iniX, maxX),
+                             extra, minThFAST, true);
+                        appendStatic(extra, true);
+                        ++mAdaptiveStats.compensatedCells;
+                        if (mAdaptiveConfig.statsEnabled)
+                            mAdaptiveStats.compensationMs += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - extraStart).count();
                     }
+                    mAdaptiveStats.staticAfter += staticCell.size();
+                    vToDistributeKeys.insert(vToDistributeKeys.end(), staticCell.begin(), staticCell.end());
                 }
             }
 
             vector<KeyPoint> &keypoints = allKeypoints[level];
             keypoints.reserve(nfeatures);
 
-            keypoints = DistributeOctTree(vToDistributeKeys, minBorderX, maxBorderX,
-                                          minBorderY, maxBorderY, mnFeaturesPerLevel[level], level);
+            if (frameQuotas[level] > 0 && !vToDistributeKeys.empty())
+                keypoints = DistributeOctTree(vToDistributeKeys, minBorderX, maxBorderX,
+                                              minBorderY, maxBorderY, frameQuotas[level], level);
+            // Octree splits can overshoot N by a few nodes. Enforce the adaptive cap
+            // only when quota adaptation is enabled; preserve legacy output otherwise.
+            if (mAdaptiveConfig.quotaEnabled && keypoints.size() > static_cast<size_t>(frameQuotas[level]))
+            {
+                std::stable_sort(keypoints.begin(), keypoints.end(),
+                    [](const cv::KeyPoint &a, const cv::KeyPoint &b) { return a.response > b.response; });
+                keypoints.resize(frameQuotas[level]);
+            }
 
             const int scaledPatchSize = PATCH_SIZE * mvScaleFactor[level];
 
@@ -1108,6 +1188,8 @@ namespace ORB_SLAM3
     int ORBextractor::operator()(InputArray _image, InputArray _mask, vector<KeyPoint> &_keypoints,
                                  OutputArray _descriptors, std::vector<int> &vLappingArea)
     {
+        mAdaptiveStats = AdaptiveStats();
+        const auto extractionStart = std::chrono::steady_clock::now();
         // cout << "[ORBextractor]: Max Features: " << nfeatures << endl;
         if (_image.empty())
             return -1;
@@ -1190,6 +1272,10 @@ namespace ORB_SLAM3
             }
         }
         // cout << "[ORBextractor]: extracted " << _keypoints.size() << " KeyPoints" << endl;
+        mAdaptiveStats.finalFeatures = nkeypoints;
+        if (mAdaptiveConfig.statsEnabled)
+            mAdaptiveStats.extractionMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - extractionStart).count();
         return monoIndex;
     }
 

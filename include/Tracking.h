@@ -333,6 +333,19 @@ namespace ORB_SLAM3
         // Current matches in frame
         int mnMatchesInliers;
 
+        // Valid only when TrackLocalMap counted inliers in the preceding RGB-D frame.
+        bool mbAdaptiveInliersValid = false;
+        bool mbAdaptiveFeedback = false;
+        bool mbAdaptiveStats = false;
+        int mnAdaptiveLowInliers = 60;
+        int mnAdaptiveHighInliers = 100;
+        double mAdaptiveRise = 0.25;
+        double mAdaptiveDecay = 0.10;
+        double mAdaptiveStrength = 0.0;
+        void LoadAdaptiveParameters(const std::string &path);
+        void UpdateAdaptiveCompensation();
+        void ResetAdaptiveCompensation();
+
         // Last Frame, KeyFrame and Relocalisation Info
         KeyFrame *mpLastKeyFrame;
         unsigned int mnLastKeyFrameId;

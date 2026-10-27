@@ -90,10 +90,44 @@ namespace ORB_SLAM3
             return mvInvLevelSigma2;
         }
 
+        struct AdaptiveConfig
+        {
+            bool fastEnabled = false;
+            bool quotaEnabled = false;
+            bool statsEnabled = false;
+            int minStaticPerCell = 5;
+            int maxFeatures = 2000;
+            double dynamicAlpha = 1.0;
+            double feedbackFastGain = 2.0;
+            double feedbackQuotaGain = 0.5;
+        };
+
+        struct AdaptiveStats
+        {
+            size_t staticBefore = 0;
+            size_t staticAfter = 0;
+            int compensatedCells = 0;
+            int targetFeatures = 0;
+            int finalFeatures = 0;
+            double dynamicRatio = 0.0;
+            double compensationMs = 0.0; // Quota calculation and additional detection/filter/merge.
+            double extractionMs = 0.0;   // Complete extraction, including descriptors.
+            std::vector<int> levelQuotas;
+        };
+
+        void ConfigureAdaptive(const AdaptiveConfig &config);
+        void SetCompensationStrength(double strength);
+        const AdaptiveStats &GetAdaptiveStats() const { return mAdaptiveStats; }
+
         std::vector<cv::Mat> mvImagePyramid;
         std::vector<cv::Mat> mvDynamicArea;
 
     protected:
+        AdaptiveConfig mAdaptiveConfig;
+        AdaptiveStats mAdaptiveStats;
+        double mCompensationStrength = 0.0;
+        bool IsDynamicCandidate(const cv::Point2f &point, int level) const;
+        std::vector<int> ComputeFrameQuotas();
         void ComputePyramid(cv::Mat image);
         void ComputeKeyPointsOctTree(std::vector<std::vector<cv::KeyPoint>> &allKeypoints);
         std::vector<cv::KeyPoint> DistributeOctTree(const std::vector<cv::KeyPoint> &vToDistributeKeys, const int &minX,

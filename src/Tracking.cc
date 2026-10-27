@@ -17,6 +17,8 @@
  */
 
 #include "Tracking.h"
+#include <stdexcept>
+#include <cmath>
 
 #include "ORBmatcher.h"
 #include "FrameDrawer.h"
@@ -348,6 +350,9 @@ namespace ORB_SLAM3
                 }
             }
         }
+
+        if (mSensor == System::RGBD || mSensor == System::IMU_RGBD)
+            LoadAdaptiveParameters(strSettingPath);
 
         initID = 0;
         lastID = 0;
@@ -1803,6 +1808,74 @@ namespace ORB_SLAM3
         return mCurrentFrame.GetPose();
     }
 
+    void Tracking::LoadAdaptiveParameters(const std::string &path)
+    {
+        // Read here so both legacy YAML and Settings (File.version=1.0) paths work.
+        cv::FileStorage settings(path, cv::FileStorage::READ);
+        const auto number = [&](const std::string &key, double fallback, double low, double high)
+        {
+            const cv::FileNode node = settings["AdaptiveFeatures." + key];
+            if (node.empty()) return fallback;
+            if ((!node.isInt() && !node.isReal()) || !std::isfinite(node.real()) ||
+                node.real() < low || node.real() > high)
+                throw std::invalid_argument("Invalid AdaptiveFeatures." + key);
+            return node.real();
+        };
+        const auto integer = [&](const std::string &key, int fallback, int low, int high)
+        {
+            const double value = number(key, fallback, low, high);
+            if (std::floor(value) != value)
+                throw std::invalid_argument("AdaptiveFeatures." + key + " must be an integer");
+            return static_cast<int>(value);
+        };
+        ORBextractor::AdaptiveConfig config;
+        config.fastEnabled = integer("FAST", 0, 0, 1) != 0;
+        config.quotaEnabled = integer("Quota", 0, 0, 1) != 0;
+        config.statsEnabled = integer("Stats", 0, 0, 1) != 0;
+        config.minStaticPerCell = integer("MinStaticPerCell", 5, 1, 1000);
+        config.maxFeatures = integer("MaxFeatures", 2000, 1, 100000);
+        config.dynamicAlpha = number("DynamicAlpha", 1.0, 0.0, 10.0);
+        config.feedbackFastGain = number("FeedbackFastGain", 2.0, 0.0, 10.0);
+        config.feedbackQuotaGain = number("FeedbackQuotaGain", 0.5, 0.0, 10.0);
+        mbAdaptiveFeedback = integer("Feedback", 0, 0, 1) != 0;
+        mbAdaptiveStats = config.statsEnabled;
+        mnAdaptiveLowInliers = integer("LowInliers", 60, 1, 100000);
+        mnAdaptiveHighInliers = integer("HighInliers", 100, mnAdaptiveLowInliers + 1, 100001);
+        if (mnAdaptiveHighInliers <= mnAdaptiveLowInliers)
+            throw std::invalid_argument("AdaptiveFeatures.HighInliers must exceed LowInliers");
+        mAdaptiveRise = number("RiseStep", 0.25, 0.001, 1.0);
+        mAdaptiveDecay = number("DecayStep", 0.10, 0.001, 1.0);
+        mpORBextractorLeft->ConfigureAdaptive(config);
+    }
+
+    void Tracking::ResetAdaptiveCompensation()
+    {
+        mbAdaptiveInliersValid = false;
+        mAdaptiveStrength = 0.0;
+    }
+
+    void Tracking::UpdateAdaptiveCompensation()
+    {
+        // Called before constructing the next frame: mState and inliers still refer
+        // to the previous frame. Never read mnMatchesInliers without validity.
+        if (!mbAdaptiveFeedback || mState == NO_IMAGES_YET || mState == NOT_INITIALIZED)
+            ResetAdaptiveCompensation();
+        else if (mState == LOST || mState == RECENTLY_LOST)
+        {
+            mAdaptiveStrength = 1.0;
+            mbAdaptiveInliersValid = false;
+        }
+        else if (mState == OK && mbAdaptiveInliersValid)
+        {
+            if (mnMatchesInliers < mnAdaptiveLowInliers)
+                mAdaptiveStrength = std::min(1.0, mAdaptiveStrength + mAdaptiveRise);
+            else if (mnMatchesInliers >= mnAdaptiveHighInliers)
+                mAdaptiveStrength = std::max(0.0, mAdaptiveStrength - mAdaptiveDecay);
+            // Hysteresis: hold strength between the low and high thresholds.
+        }
+        mpORBextractorLeft->SetCompensationStrength(mAdaptiveStrength);
+    }
+
     Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB, const cv::Mat &imD, const double &timestamp, string filename)
     {
         mImGray = imRGB;
@@ -1980,6 +2053,7 @@ namespace ORB_SLAM3
         }
 
         mpORBextractorLeft->mvDynamicArea = mvDynamicArea;
+        UpdateAdaptiveCompensation();
 
         if (mImGray.channels() == 3)
         {
@@ -2020,7 +2094,26 @@ namespace ORB_SLAM3
 
         mpFrameDrawer->UpdateSegmentation(mImColor, vSegVisObjects);
 
+        // Track may reset the map/frame, so snapshot extraction metadata first.
+        const auto adaptiveStats = mpORBextractorLeft->GetAdaptiveStats();
+        const auto extractedFrameId = mCurrentFrame.mnId;
+        const double appliedStrength = mAdaptiveStrength;
         Track();
+        if (mbAdaptiveStats)
+        {
+            std::cout << "[AdaptiveFeatures] frame=" << extractedFrameId
+                      << " dynamic_ratio=" << adaptiveStats.dynamicRatio
+                      << " strength=" << appliedStrength
+                      << " static_before=" << adaptiveStats.staticBefore
+                      << " static_after=" << adaptiveStats.staticAfter
+                      << " compensated_cells=" << adaptiveStats.compensatedCells
+                      << " target=" << adaptiveStats.targetFeatures
+                      << " orb=" << adaptiveStats.finalFeatures
+                      << " inliers=" << (mbAdaptiveInliersValid ? mnMatchesInliers : -1)
+                      << " state=" << mState
+                      << " compensation_ms=" << adaptiveStats.compensationMs
+                      << " extraction_ms=" << adaptiveStats.extractionMs << std::endl;
+        }
 
         return mCurrentFrame.GetPose();
     }
@@ -2257,6 +2350,7 @@ namespace ORB_SLAM3
 
     void Tracking::Track()
     {
+        mbAdaptiveInliersValid = false;
 
         if (bStepByStep)
         {
@@ -3112,6 +3206,7 @@ namespace ORB_SLAM3
 
     void Tracking::CreateMapInAtlas()
     {
+        ResetAdaptiveCompensation();
         mnLastInitFrameId = mCurrentFrame.mnId;
         mpAtlas->CreateNewMap();
         if (mSensor == System::IMU_STEREO || mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_RGBD)
@@ -3473,6 +3568,8 @@ namespace ORB_SLAM3
                     mCurrentFrame.mvpMapPoints[i] = static_cast<MapPoint *>(NULL);
             }
         }
+
+        mbAdaptiveInliersValid = true;
 
         // Decide if the tracking was succesful
         // More restrictive if there was a relocalization recently
@@ -4236,6 +4333,7 @@ namespace ORB_SLAM3
 
     void Tracking::Reset(bool bLocMap)
     {
+        ResetAdaptiveCompensation();
         Verbose::PrintMess("System Reseting", Verbose::VERBOSITY_NORMAL);
 
         if (mpViewer)
@@ -4296,6 +4394,7 @@ namespace ORB_SLAM3
 
     void Tracking::ResetActiveMap(bool bLocMap)
     {
+        ResetAdaptiveCompensation();
         Verbose::PrintMess("Active map Reseting", Verbose::VERBOSITY_NORMAL);
         if (mpViewer)
         {
