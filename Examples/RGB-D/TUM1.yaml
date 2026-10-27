@@ -69,3 +69,19 @@ Viewer.ViewpointY: -0.7
 Viewer.ViewpointZ: -1.8
 Viewer.ViewpointF: 500.0
 
+
+# Adaptive static features (RGB-D only; independent opt-in switches).
+# Enable FAST, Quota and Feedback together to use the complete mechanism.
+AdaptiveFeatures.FAST: 0
+AdaptiveFeatures.Quota: 0
+AdaptiveFeatures.Feedback: 0
+AdaptiveFeatures.Stats: 0
+AdaptiveFeatures.MinStaticPerCell: 5
+AdaptiveFeatures.MaxFeatures: 2000
+AdaptiveFeatures.DynamicAlpha: 1.0
+AdaptiveFeatures.FeedbackFastGain: 2.0
+AdaptiveFeatures.FeedbackQuotaGain: 0.5
+AdaptiveFeatures.LowInliers: 60
+AdaptiveFeatures.HighInliers: 100
+AdaptiveFeatures.RiseStep: 0.25
+AdaptiveFeatures.DecayStep: 0.10
