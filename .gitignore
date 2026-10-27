@@ -121,6 +121,7 @@ Testing/
 test-results/
 test-output/
 __pycache__/
+.vscode/
 .pytest_cache/
 *.log
 *.tmp
