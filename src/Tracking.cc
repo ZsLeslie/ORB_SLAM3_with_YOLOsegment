@@ -46,14 +46,6 @@ namespace ORB_SLAM3
 {
     namespace
     {
-        const int kMinBackgroundTracks = 40;
-        const int kMinPersonTracks = 8;
-        const float kPersonMatchMaxCenterDistRatio = 0.75f;
-        const float kMovingResidualPx = 3.0f;
-        const float kMovingResidualRatio = 0.25f;
-        const float kMovingCenterResidualPx = 6.0f;
-        const int kPersonCloudMaskMaxMissFrames = 2;
-
         cv::Point2f RectCenter(const cv::Rect &rect)
         {
             return cv::Point2f(rect.x + 0.5f * rect.width, rect.y + 0.5f * rect.height);
@@ -187,7 +179,7 @@ namespace ORB_SLAM3
 
         bool EstimateBackgroundAffine(const cv::Mat &lastGray, const cv::Mat &currentGray,
                                       const cv::Mat &lastPersonMask, const cv::Mat &currentPersonMask,
-                                      cv::Mat &affine)
+                                      cv::Mat &affine, const PersonOpticalFlowConfig &config)
         {
             affine = cv::Mat();
             if (lastGray.empty() || currentGray.empty() || lastGray.size() != currentGray.size())
@@ -200,15 +192,20 @@ namespace ORB_SLAM3
                 backgroundMask.setTo(0, currentPersonMask);
 
             std::vector<cv::Point2f> ptsLast;
-            cv::goodFeaturesToTrack(lastGray, ptsLast, 600, 0.01, 12.0, backgroundMask, 3, false, 0.04);
-            if (ptsLast.size() < kMinBackgroundTracks)
+            cv::goodFeaturesToTrack(lastGray, ptsLast, config.backgroundMaxCorners,
+                                    config.backgroundQualityLevel, config.backgroundMinDistance,
+                                    backgroundMask, config.backgroundBlockSize, false, 0.04);
+            if (ptsLast.size() < config.minBackgroundTracks)
                 return false;
 
             std::vector<cv::Point2f> ptsCurrent;
             std::vector<uchar> status;
             std::vector<float> err;
             cv::calcOpticalFlowPyrLK(lastGray, currentGray, ptsLast, ptsCurrent, status, err,
-                                     cv::Size(21, 21), 3);
+                                     cv::Size(config.lkWindowSize, config.lkWindowSize), config.lkMaxLevel,
+                                     cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS,
+                                                      config.lkMaxIterations, config.lkEpsilon),
+                                     0, config.lkMinEigenThreshold);
 
             std::vector<cv::Point2f> inLast;
             std::vector<cv::Point2f> inCurrent;
@@ -223,31 +220,34 @@ namespace ORB_SLAM3
                 }
             }
 
-            if (inLast.size() < kMinBackgroundTracks)
+            if (inLast.size() < config.minBackgroundTracks)
                 return false;
 
-            affine = cv::estimateAffinePartial2D(inLast, inCurrent, cv::noArray(), cv::RANSAC, 3.0);
+            affine = cv::estimateAffinePartial2D(inLast, inCurrent, cv::noArray(), cv::RANSAC,
+                                                  config.ransacReprojThreshold, config.ransacMaxIterations,
+                                                  config.ransacConfidence, config.ransacRefineIterations);
             if (!affine.empty() && affine.type() != CV_64F)
                 affine.convertTo(affine, CV_64F);
             return !affine.empty();
         }
 
         int MatchPreviousPerson(const PersonInstanceMotionInfo &currentPerson,
-                                const std::vector<PersonInstanceMotionInfo> &lastPersons)
+                                const std::vector<PersonInstanceMotionInfo> &lastPersons,
+                                const PersonOpticalFlowConfig &config)
         {
             int bestIdx = -1;
             float bestScore = std::numeric_limits<float>::max();
-            const float maxDist = kPersonMatchMaxCenterDistRatio *
+            const float maxDist = config.matchMaxCenterDistRatio *
                                   std::max(currentPerson.bbox.width, currentPerson.bbox.height);
 
             for (size_t i = 0; i < lastPersons.size(); ++i)
             {
                 const float iou = RectIoU(currentPerson.bbox, lastPersons[i].bbox);
                 const float dist = cv::norm(currentPerson.center - lastPersons[i].center);
-                if (iou <= 0.02f && dist > maxDist)
+                if (iou <= config.matchMinIoU && dist > maxDist)
                     continue;
 
-                const float score = dist - 80.0f * iou;
+                const float score = dist - config.matchIoUWeight * iou;
                 if (score < bestScore)
                 {
                     bestScore = score;
@@ -258,20 +258,23 @@ namespace ORB_SLAM3
         }
 
         bool IsPersonMovingByFlow(const cv::Mat &lastGray, const cv::Mat &currentGray, const cv::Mat &backgroundAffine,
-                                  const PersonInstanceMotionInfo &lastPerson)
+                                  const PersonInstanceMotionInfo &lastPerson, const PersonOpticalFlowConfig &config)
         {
             if (backgroundAffine.empty() || lastPerson.mask.empty())
                 return false;
 
-            std::vector<cv::Point2f> ptsLast = SampleMaskPoints(lastPerson.mask, lastPerson.bbox, 8);
-            if (ptsLast.size() < kMinPersonTracks)
+            std::vector<cv::Point2f> ptsLast = SampleMaskPoints(lastPerson.mask, lastPerson.bbox, config.personSampleStep);
+            if (ptsLast.size() < config.minPersonTracks)
                 return false;
 
             std::vector<cv::Point2f> ptsCurrent;
             std::vector<uchar> status;
             std::vector<float> err;
             cv::calcOpticalFlowPyrLK(lastGray, currentGray, ptsLast, ptsCurrent, status, err,
-                                     cv::Size(21, 21), 3);
+                                     cv::Size(config.lkWindowSize, config.lkWindowSize), config.lkMaxLevel,
+                                     cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS,
+                                                      config.lkMaxIterations, config.lkEpsilon),
+                                     0, config.lkMinEigenThreshold);
 
             std::vector<float> residuals;
             residuals.reserve(ptsLast.size());
@@ -284,17 +287,17 @@ namespace ORB_SLAM3
                 const cv::Point2f predicted = TransformPointByAffine(ptsLast[i], backgroundAffine);
                 const float residual = cv::norm(ptsCurrent[i] - predicted);
                 residuals.push_back(residual);
-                if (residual > kMovingResidualPx)
+                if (residual > config.movingResidualPx)
                     ++movingCount;
             }
 
-            if (residuals.size() < kMinPersonTracks)
+            if (residuals.size() < config.minPersonTracks)
                 return false;
 
             std::nth_element(residuals.begin(), residuals.begin() + residuals.size() / 2, residuals.end());
             const float medianResidual = residuals[residuals.size() / 2];
             const float movingRatio = static_cast<float>(movingCount) / static_cast<float>(residuals.size());
-            return medianResidual > kMovingResidualPx || movingRatio > kMovingResidualRatio;
+            return medianResidual > config.movingResidualPx || movingRatio > config.movingResidualRatio;
         }
     }
 
@@ -352,7 +355,10 @@ namespace ORB_SLAM3
         }
 
         if (mSensor == System::RGBD || mSensor == System::IMU_RGBD)
+        {
             LoadAdaptiveParameters(strSettingPath);
+            LoadOpticalFlowParameters(strSettingPath);
+        }
 
         initID = 0;
         lastID = 0;
@@ -1808,6 +1814,60 @@ namespace ORB_SLAM3
         return mCurrentFrame.GetPose();
     }
 
+    void Tracking::LoadOpticalFlowParameters(const std::string &path)
+    {
+        // Both legacy YAML and File.version=1.0 use this optional configuration.
+        cv::FileStorage settings(path, cv::FileStorage::READ);
+        if (!settings.isOpened())
+            throw std::invalid_argument("Cannot open optical flow settings: " + path);
+        const auto number = [&](const std::string &key, double fallback, double low, double high)
+        {
+            const cv::FileNode node = settings["OpticalFlow." + key];
+            if (node.empty()) return fallback;
+            if ((!node.isInt() && !node.isReal()) || !std::isfinite(node.real()) ||
+                node.real() < low || node.real() > high)
+                throw std::invalid_argument("Invalid OpticalFlow." + key);
+            return node.real();
+        };
+        const auto integer = [&](const std::string &key, int fallback, int low, int high)
+        {
+            const double value = number(key, fallback, low, high);
+            if (std::floor(value) != value)
+                throw std::invalid_argument("OpticalFlow." + key + " must be an integer");
+            return static_cast<int>(value);
+        };
+        PersonOpticalFlowConfig config;
+        config.enabled = integer("Enabled", config.enabled, 0, 1) != 0;
+        config.backgroundMaxCorners = integer("BackgroundMaxCorners", config.backgroundMaxCorners, 2, 100000);
+        config.backgroundQualityLevel = number("BackgroundQualityLevel", config.backgroundQualityLevel, 1e-06, 1.0);
+        config.backgroundMinDistance = number("BackgroundMinDistance", config.backgroundMinDistance, 0.0, 10000.0);
+        config.backgroundBlockSize = integer("BackgroundBlockSize", config.backgroundBlockSize, 3, 99);
+        config.minBackgroundTracks = integer("MinBackgroundTracks", config.minBackgroundTracks, 2, 100000);
+        config.minPersonTracks = integer("MinPersonTracks", config.minPersonTracks, 1, 100000);
+        config.personSampleStep = integer("PersonSampleStep", config.personSampleStep, 1, 10000);
+        config.lkWindowSize = integer("LKWindowSize", config.lkWindowSize, 3, 255);
+        config.lkMaxLevel = integer("LKMaxLevel", config.lkMaxLevel, 0, 8);
+        config.lkMaxIterations = integer("LKMaxIterations", config.lkMaxIterations, 1, 100);
+        config.lkEpsilon = number("LKEpsilon", config.lkEpsilon, 0.0, 10.0);
+        config.lkMinEigenThreshold = number("LKMinEigenThreshold", config.lkMinEigenThreshold, 0.0, 1.0);
+        config.ransacReprojThreshold = number("RansacReprojThreshold", config.ransacReprojThreshold, 1e-06, 1000.0);
+        config.ransacMaxIterations = integer("RansacMaxIterations", config.ransacMaxIterations, 1, 100000);
+        config.ransacConfidence = number("RansacConfidence", config.ransacConfidence, 1e-06, 0.999999);
+        config.ransacRefineIterations = integer("RansacRefineIterations", config.ransacRefineIterations, 0, 1000);
+        config.matchMaxCenterDistRatio = number("MatchMaxCenterDistRatio", config.matchMaxCenterDistRatio, 0.0, 10.0);
+        config.matchMinIoU = number("MatchMinIoU", config.matchMinIoU, 0.0, 1.0);
+        config.matchIoUWeight = number("MatchIoUWeight", config.matchIoUWeight, 0.0, 10000.0);
+        config.movingResidualPx = number("MovingResidualPx", config.movingResidualPx, 0.0, 1000.0);
+        config.movingResidualRatio = number("MovingResidualRatio", config.movingResidualRatio, 0.0, 1.0);
+        config.movingCenterResidualPx = number("MovingCenterResidualPx", config.movingCenterResidualPx, 0.0, 1000.0);
+        config.cloudMaskMaxMissFrames = integer("CloudMaskMaxMissFrames", config.cloudMaskMaxMissFrames, 0, 1000);
+        if (config.backgroundBlockSize % 2 == 0 || config.lkWindowSize % 2 == 0)
+            throw std::invalid_argument("OpticalFlow.BackgroundBlockSize and LKWindowSize must be odd");
+        if (config.minBackgroundTracks > config.backgroundMaxCorners)
+            throw std::invalid_argument("OpticalFlow.MinBackgroundTracks must not exceed BackgroundMaxCorners");
+        mOpticalFlow = config;
+    }
+
     void Tracking::LoadAdaptiveParameters(const std::string &path)
     {
         // Read here so both legacy YAML and Settings (File.version=1.0) paths work.
@@ -1890,12 +1950,15 @@ namespace ORB_SLAM3
         std::vector<PersonInstanceMotionInfo> vCurrentPersonInstances;
 
         cv::Mat currentMotionGray;
-        if (img.channels() == 3)
-            cv::cvtColor(img, currentMotionGray, mbRGB ? cv::COLOR_RGB2GRAY : cv::COLOR_BGR2GRAY);
-        else if (img.channels() == 4)
-            cv::cvtColor(img, currentMotionGray, mbRGB ? cv::COLOR_RGBA2GRAY : cv::COLOR_BGRA2GRAY);
-        else
-            currentMotionGray = img.clone();
+        if (mOpticalFlow.enabled)
+        {
+            if (img.channels() == 3)
+                cv::cvtColor(img, currentMotionGray, mbRGB ? cv::COLOR_RGB2GRAY : cv::COLOR_BGR2GRAY);
+            else if (img.channels() == 4)
+                cv::cvtColor(img, currentMotionGray, mbRGB ? cv::COLOR_RGBA2GRAY : cv::COLOR_BGRA2GRAY);
+            else
+                currentMotionGray = img.clone();
+        }
 
         std::vector<Detection> res = mpYoloDetector->inference(img);
 
@@ -1977,18 +2040,21 @@ namespace ORB_SLAM3
             }
         }
 
-        cv::Mat lastPersonUnion = BuildPersonUnionMask(mvLastPersonInstances, currentMotionGray.size());
-        cv::Mat currentPersonUnion = BuildPersonUnionMask(vCurrentPersonInstances, currentMotionGray.size());
-
         cv::Mat backgroundAffine;
-        const bool hasBackgroundMotion = EstimateBackgroundAffine(mLastPersonMotionGray, currentMotionGray,
-                                                                  lastPersonUnion, currentPersonUnion,
-                                                                  backgroundAffine);
+        bool hasBackgroundMotion = false;
+        if (mOpticalFlow.enabled)
+        {
+            const cv::Mat lastPersonUnion = BuildPersonUnionMask(mvLastPersonInstances, img.size());
+            const cv::Mat currentPersonUnion = BuildPersonUnionMask(vCurrentPersonInstances, img.size());
+            hasBackgroundMotion = EstimateBackgroundAffine(mLastPersonMotionGray, currentMotionGray,
+                                                            lastPersonUnion, currentPersonUnion,
+                                                            backgroundAffine, mOpticalFlow);
+        }
 
-        cv::Mat personCloudMask = BuildPersonCloudMask(vCurrentPersonInstances, imDepth, currentMotionGray.size());
+        cv::Mat personCloudMask = BuildPersonCloudMask(vCurrentPersonInstances, imDepth, img.size());
         bool propagatedPersonCloudMask = false;
         if (vCurrentPersonInstances.empty() && !mLastPersonCloudMask.empty() && hasBackgroundMotion &&
-            mPersonCloudMaskMissFrames < kPersonCloudMaskMaxMissFrames)
+            mPersonCloudMaskMissFrames < mOpticalFlow.cloudMaskMaxMissFrames)
         {
             cv::warpAffine(mLastPersonCloudMask, personCloudMask, backgroundAffine,
                            currentMotionGray.size(), cv::INTER_NEAREST,
@@ -1999,25 +2065,26 @@ namespace ORB_SLAM3
         cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9));
         for (const auto &currentPerson : vCurrentPersonInstances)
         {
-            bool isMoving = false;
-            if (hasBackgroundMotion)
+            // With flow disabled, use semantic-only filtering of every detected person.
+            bool isMoving = !mOpticalFlow.enabled;
+            if (mOpticalFlow.enabled && hasBackgroundMotion)
             {
-                const int lastIdx = MatchPreviousPerson(currentPerson, mvLastPersonInstances);
+                const int lastIdx = MatchPreviousPerson(currentPerson, mvLastPersonInstances, mOpticalFlow);
                 if (lastIdx >= 0)
                 {
                     const cv::Point2f predictedCenter =
                         TransformPointByAffine(mvLastPersonInstances[lastIdx].center, backgroundAffine);
                     const float centerResidual = cv::norm(currentPerson.center - predictedCenter);
-                    isMoving = centerResidual > kMovingCenterResidualPx ||
+                    isMoving = centerResidual > mOpticalFlow.movingCenterResidualPx ||
                                IsPersonMovingByFlow(mLastPersonMotionGray, currentMotionGray, backgroundAffine,
-                                                    mvLastPersonInstances[lastIdx]);
+                                                    mvLastPersonInstances[lastIdx], mOpticalFlow);
                 }
                 else
                 {
                     isMoving = true;
                 }
             }
-            else if (!mLastPersonMotionGray.empty())
+            else if (mOpticalFlow.enabled && !mLastPersonMotionGray.empty())
             {
                 isMoving = true;
             }
@@ -2033,8 +2100,16 @@ namespace ORB_SLAM3
             }
         }
 
-        mvLastPersonInstances = vCurrentPersonInstances;
-        mLastPersonMotionGray = currentMotionGray.clone();
+        if (mOpticalFlow.enabled)
+        {
+            mvLastPersonInstances = vCurrentPersonInstances;
+            mLastPersonMotionGray = currentMotionGray.clone();
+        }
+        else
+        {
+            mvLastPersonInstances.clear();
+            mLastPersonMotionGray.release();
+        }
 
         if (!vCurrentPersonInstances.empty())
         {

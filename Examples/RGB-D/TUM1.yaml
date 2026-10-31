@@ -85,3 +85,53 @@ AdaptiveFeatures.LowInliers: 60
 AdaptiveFeatures.HighInliers: 100
 AdaptiveFeatures.RiseStep: 0.25
 AdaptiveFeatures.DecayStep: 0.10
+
+# RGB-D optical flow motion classification. Defaults match the original implementation.
+# 1: classify person motion; 0: filter all YOLO persons without optical flow
+OpticalFlow.Enabled: 1
+# Maximum background Shi-Tomasi corners
+OpticalFlow.BackgroundMaxCorners: 600
+# Corner quality relative to the strongest corner
+OpticalFlow.BackgroundQualityLevel: 0.01
+# Minimum background corner spacing in pixels
+OpticalFlow.BackgroundMinDistance: 12.0
+# Odd corner detection block size
+OpticalFlow.BackgroundBlockSize: 3
+# Minimum valid background tracks for affine estimation
+OpticalFlow.MinBackgroundTracks: 40
+# Minimum valid person tracks for residual classification
+OpticalFlow.MinPersonTracks: 8
+# Person mask sampling stride in pixels
+OpticalFlow.PersonSampleStep: 8
+# Odd LK tracking window size
+OpticalFlow.LKWindowSize: 21
+# Maximum LK pyramid level; 0 uses the original image only
+OpticalFlow.LKMaxLevel: 3
+# LK termination iteration limit
+OpticalFlow.LKMaxIterations: 30
+# LK termination displacement tolerance
+OpticalFlow.LKEpsilon: 0.01
+# LK minimum eigenvalue threshold
+OpticalFlow.LKMinEigenThreshold: 0.0001
+# Partial affine RANSAC reprojection threshold in pixels
+OpticalFlow.RansacReprojThreshold: 3.0
+# RANSAC iteration limit
+OpticalFlow.RansacMaxIterations: 2000
+# RANSAC confidence, strictly between 0 and 1
+OpticalFlow.RansacConfidence: 0.99
+# Affine refinement iterations; 0 disables refinement
+OpticalFlow.RansacRefineIterations: 10
+# Person match distance relative to current bbox maximum dimension
+OpticalFlow.MatchMaxCenterDistRatio: 0.75
+# Low IoU and excessive center distance reject a person match
+OpticalFlow.MatchMinIoU: 0.02
+# Person match score = center distance - weight * IoU
+OpticalFlow.MatchIoUWeight: 80.0
+# Motion-compensated person flow residual threshold in pixels
+OpticalFlow.MovingResidualPx: 3.0
+# Fraction of person tracks above the residual threshold
+OpticalFlow.MovingResidualRatio: 0.25
+# Motion-compensated bbox center displacement threshold in pixels
+OpticalFlow.MovingCenterResidualPx: 6.0
+# Maximum missing-person frames for affine mask propagation; 0 disables it
+OpticalFlow.CloudMaskMaxMissFrames: 2

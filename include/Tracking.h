@@ -62,6 +62,35 @@ namespace ORB_SLAM3
         float area = 0.0f;
     };
 
+    // RGB-D person motion classification. Defaults reproduce the original flow settings.
+    struct PersonOpticalFlowConfig
+    {
+        bool enabled = true;
+        int backgroundMaxCorners = 600;
+        double backgroundQualityLevel = 0.01;
+        double backgroundMinDistance = 12.0;
+        int backgroundBlockSize = 3;
+        int minBackgroundTracks = 40;
+        int minPersonTracks = 8;
+        int personSampleStep = 8;
+        int lkWindowSize = 21;
+        int lkMaxLevel = 3;
+        int lkMaxIterations = 30;
+        double lkEpsilon = 0.01;
+        double lkMinEigenThreshold = 1e-4;
+        double ransacReprojThreshold = 3.0;
+        int ransacMaxIterations = 2000;
+        double ransacConfidence = 0.99;
+        int ransacRefineIterations = 10;
+        float matchMaxCenterDistRatio = 0.75f;
+        float matchMinIoU = 0.02f;
+        float matchIoUWeight = 80.0f;
+        float movingResidualPx = 3.0f;
+        float movingResidualRatio = 0.25f;
+        float movingCenterResidualPx = 6.0f;
+        int cloudMaskMaxMissFrames = 2;
+    };
+
     class Tracking
     {
 
@@ -390,6 +419,8 @@ namespace ORB_SLAM3
         cv::Mat mLastPersonMotionGray;
         cv::Mat mLastPersonCloudMask;
         int mPersonCloudMaskMissFrames = 0;
+        PersonOpticalFlowConfig mOpticalFlow;
+        void LoadOpticalFlowParameters(const std::string &path);
 
         void newParameterLoader(Settings *settings);
 

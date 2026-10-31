@@ -86,3 +86,48 @@ extraction_ms: min=9.250, max=15.605, mean=11.358
 ```
 
 计时单位为毫秒。直接补偿耗时不包含更多特征带来的后续匹配/优化开销；结果随硬件与线程调度变化。
+
+## 光流开关与参数
+
+五份 RGB-D / IMU-RGB-D 示例 YAML 均提供 `OpticalFlow.*` 配置，旧版 YAML 和 `File.version: "1.0"` 均支持。未填写时默认开启，参数沿用原代码数值。
+
+```yaml
+OpticalFlow.Enabled: 1  # 开启背景/人体光流及运动判定
+# OpticalFlow.Enabled: 0  # 关闭光流，改为纯 YOLO 人体过滤
+```
+
+关闭时不执行背景角点检测、LK 光流、RANSAC 或人体跨帧运动匹配，所有当前检测到的人体（包括静态人体和首帧人体）都使用原有 9×9 膨胀掩码过滤 ORB 点。依赖背景仿射变换的漏检点云掩码传播也停止；当前帧人体点云过滤仍保留。开启时保留原来的首帧、不匹配人体以及光流失败处理。此开关独立于 `AdaptiveFeatures.*`，不会开启统计输出。修改配置后需重启程序，不支持运行时热更新。
+
+以下参数全部以 `OpticalFlow.` 为前缀；像素阈值使用输入 RGB 图像坐标。
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| BackgroundMaxCorners | 600 | 背景角点上限 |
+| BackgroundQualityLevel | 0.01 | Shi-Tomasi 角点质量阈值 |
+| BackgroundMinDistance | 12.0 | 背景角点最小间距（像素） |
+| BackgroundBlockSize | 3 | 角点检测块边长，奇数 |
+| MinBackgroundTracks | 40 | 估计背景变换所需的最少有效轨迹 |
+| MinPersonTracks | 8 | 人体光流判断所需的最少有效轨迹 |
+| PersonSampleStep | 8 | 人体掩码内网格采样步长（像素） |
+| LKWindowSize | 21 | 背景和人体共用的 LK 窗口边长，奇数 |
+| LKMaxLevel | 3 | LK 最大金字塔层索引，0 表示仅原图 |
+| LKMaxIterations | 30 | LK 终止条件的迭代上限 |
+| LKEpsilon | 0.01 | LK 终止条件的位移容差 |
+| LKMinEigenThreshold | 0.0001 | LK 最小特征值阈值 |
+| RansacReprojThreshold | 3.0 | 部分仿射模型的重投影阈值（像素） |
+| RansacMaxIterations | 2000 | RANSAC 迭代上限 |
+| RansacConfidence | 0.99 | RANSAC 置信度，严格位于 0 和 1 之间 |
+| RansacRefineIterations | 10 | 仿射模型细化次数，0 表示不细化 |
+| MatchMaxCenterDistRatio | 0.75 | 人体匹配距离相对当前框最长边的比例 |
+| MatchMinIoU | 0.02 | IoU 不超过此值且中心距离过大时，拒绝匹配 |
+| MatchIoUWeight | 80.0 | 匹配分数为中心距离减去该权重乘 IoU，取最小值 |
+| MovingResidualPx | 3.0 | 人体光流补偿残差阈值（像素） |
+| MovingResidualRatio | 0.25 | 超过残差阈值的轨迹占比阈值 |
+| MovingCenterResidualPx | 6.0 | 人体框中心的运动补偿残差阈值（像素） |
+| CloudMaskMaxMissFrames | 2 | 漏检时依靠背景变换传播点云掩码的最大帧数，0 表示禁用 |
+
+人体中心残差超过阈值，或人体光流残差中位数超过阈值，或超阈值轨迹比例超过阈值，任一成立即判为动态。此处均为严格大于比较。
+
+配置加载会校验数值类型、有限性和范围，包括整数参数、奇数窗口、置信度及 `MinBackgroundTracks <= BackgroundMaxCorners`；非法值在启动时报告对应参数错误。YOLO 分割阈值、9×9 掩码膨胀和点云深度补全参数不属于光流配置，本次保持不变。
+
+光流配置验证：完整 `rgbd_tum` 构建通过；默认参数的仿射估计、人体运动判定及匹配与改动前实现对照通过；参数覆盖和非法值校验通过。`walking_xyz` 前 30 帧分别开启/关闭光流均正常退出，各帧最终状态均为 OK；gdb 断点计数确认关闭时 LK 调用为 0，开启时存在 LK 调用。临时测试源码和产物已清理，未新增仓库测试文件。
