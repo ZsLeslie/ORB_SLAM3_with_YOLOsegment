@@ -48,6 +48,9 @@ namespace ORB_SLAM3
             FAST_SCORE = 1
         };
 
+        // cv::KeyPoint::class_id provenance tag; ordinary FAST points keep -1.
+        static constexpr int COMPENSATED_KEYPOINT = 1;
+
         ORBextractor(int nfeatures, float scaleFactor, int nlevels,
                      int iniThFAST, int minThFAST);
 

@@ -78,6 +78,7 @@ namespace ORB_SLAM3
 
         cv::Scalar standardColor(0, 255, 0);
         cv::Scalar odometryColor(255, 0, 0);
+        cv::Scalar compensatedColor(0, 0, 255);
 
         cv::Mat segVisImg;
         std::vector<SegVisObject> vSegVisObjects;
@@ -92,17 +93,16 @@ namespace ORB_SLAM3
             mIm.copyTo(im);
             mSegVisImg.copyTo(segVisImg);
             vSegVisObjects = mvSegVisObjects;
+            vCurrentKeys = mvCurrentKeys;
 
             if (mState == Tracking::NOT_INITIALIZED)
             {
-                vCurrentKeys = mvCurrentKeys;
                 vIniKeys = mvIniKeys;
                 vMatches = mvIniMatches;
                 vTracks = mvTracks;
             }
             else if (mState == Tracking::OK)
             {
-                vCurrentKeys = mvCurrentKeys;
                 vbVO = mvbVO;
                 vbMap = mvbMap;
 
@@ -117,10 +117,6 @@ namespace ORB_SLAM3
 
                 vCurrentDepth = mvCurrentDepth;
                 thDepth = mThDepth;
-            }
-            else if (mState == Tracking::LOST)
-            {
-                vCurrentKeys = mvCurrentKeys;
             }
         }
 
@@ -241,21 +237,31 @@ namespace ORB_SLAM3
                         pt2.y = vCurrentKeys[i].pt.y + r;
                     }
 
-                    // This is a match to a MapPoint in the map
+                    const cv::Scalar color =
+                        vCurrentKeys[i].class_id == ORBextractor::COMPENSATED_KEYPOINT ?
+                        compensatedColor : (vbMap[i] ? standardColor : odometryColor);
+                    cv::rectangle(im, pt1, pt2, color);
+                    cv::circle(im, point, 2, color, -1);
+
+                    // Preserve map/VO counters regardless of feature provenance.
                     if (vbMap[i])
                     {
-                        cv::rectangle(im, pt1, pt2, standardColor);
-                        cv::circle(im, point, 2, standardColor, -1);
                         mnTracked++;
                     }
                     else // This is match to a "visual odometry" MapPoint created in the last frame
                     {
-                        cv::rectangle(im, pt1, pt2, odometryColor);
-                        cv::circle(im, point, 2, odometryColor, -1);
                         mnTrackedVO++;
                     }
                 }
             }
+        }
+
+        // Show all retained compensation points, even before a map match exists.
+        // Draw last so segmentation overlays and initialization tracks cannot hide them.
+        for (const auto &key : vCurrentKeys)
+        {
+            if (key.class_id == ORBextractor::COMPENSATED_KEYPOINT)
+                cv::circle(im, key.pt / imageScale, 2, compensatedColor, -1);
         }
 
         cv::Mat imWithInfo;

@@ -945,6 +945,10 @@ namespace ORB_SLAM3
                             if (deduplicate && std::any_of(staticCell.begin(), staticCell.end(),
                                 [&](const cv::KeyPoint &old) { return old.pt == key.pt; }))
                                 continue;
+                            // Only new adaptive candidates are tagged; duplicates retain
+                            // their original provenance. KeyPoint copies preserve this tag.
+                            if (deduplicate)
+                                key.class_id = COMPENSATED_KEYPOINT;
                             staticCell.push_back(key);
                         }
                     };
