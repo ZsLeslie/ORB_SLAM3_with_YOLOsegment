@@ -871,6 +871,9 @@ namespace ORB_SLAM3
     void ORBextractor::ComputeKeyPointsOctTree(vector<vector<KeyPoint>> &allKeypoints)
     {
         allKeypoints.resize(nlevels);
+        // Without compensation, retain the original ORB candidates and remove
+        // masked features only after descriptor extraction in operator().
+        const bool filterCandidates = mAdaptiveConfig.fastEnabled || mAdaptiveConfig.quotaEnabled;
         const auto quotaStart = std::chrono::steady_clock::now();
         const std::vector<int> frameQuotas = ComputeFrameQuotas();
         if (mAdaptiveConfig.statsEnabled)
@@ -933,6 +936,7 @@ namespace ORB_SLAM3
                     }
 
                     vector<cv::KeyPoint> staticCell;
+                    size_t staticCount = 0;
                     const auto appendStatic = [&](const vector<cv::KeyPoint> &detected,
                                                   bool deduplicate)
                     {
@@ -940,16 +944,20 @@ namespace ORB_SLAM3
                         {
                             key.pt.x += j * wCell;
                             key.pt.y += i * hCell;
-                            if (IsDynamicCandidate(key.pt + cv::Point2f(minBorderX, minBorderY), level))
+                            const bool isDynamic = IsDynamicCandidate(
+                                key.pt + cv::Point2f(minBorderX, minBorderY), level);
+                            if (filterCandidates && isDynamic)
                                 continue;
                             if (deduplicate && std::any_of(staticCell.begin(), staticCell.end(),
                                 [&](const cv::KeyPoint &old) { return old.pt == key.pt; }))
                                 continue;
                             staticCell.push_back(key);
+                            if (!isDynamic)
+                                ++staticCount;
                         }
                     };
                     appendStatic(vKeysCell, false);
-                    mAdaptiveStats.staticBefore += staticCell.size();
+                    mAdaptiveStats.staticBefore += staticCount;
 
                     const double required = mAdaptiveConfig.minStaticPerCell *
                         (1.0 + mAdaptiveConfig.feedbackFastGain * mCompensationStrength);
@@ -966,7 +974,7 @@ namespace ORB_SLAM3
                             mAdaptiveStats.compensationMs += std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - extraStart).count();
                     }
-                    mAdaptiveStats.staticAfter += staticCell.size();
+                    mAdaptiveStats.staticAfter += staticCount;
                     vToDistributeKeys.insert(vToDistributeKeys.end(), staticCell.begin(), staticCell.end());
                 }
             }
@@ -1271,6 +1279,36 @@ namespace ORB_SLAM3
                 i++;
             }
         }
+        if (!mAdaptiveConfig.fastEnabled && !mAdaptiveConfig.quotaEnabled &&
+            !mvDynamicArea.empty() && nkeypoints > 0)
+        {
+            // Legacy path: finish the standard ORB pipeline first, then discard
+            // masked features together with their descriptor rows. Coordinates
+            // are already in the original image, so use level 0 for the mask test.
+            vector<KeyPoint> filteredKeys;
+            filteredKeys.reserve(nkeypoints);
+            Mat filteredDescriptors(nkeypoints, 32, CV_8U);
+            int filteredMonoCount = 0;
+            for (int i = 0; i < nkeypoints; ++i)
+            {
+                if (IsDynamicCandidate(_keypoints[i].pt, 0))
+                    continue;
+
+                const int outputIndex = static_cast<int>(filteredKeys.size());
+                filteredKeys.push_back(_keypoints[i]);
+                descriptors.row(i).copyTo(filteredDescriptors.row(outputIndex));
+                if (i < monoIndex)
+                    ++filteredMonoCount;
+            }
+            _keypoints.swap(filteredKeys);
+            nkeypoints = static_cast<int>(_keypoints.size());
+            monoIndex = filteredMonoCount;
+            if (nkeypoints == 0)
+                _descriptors.release();
+            else
+                filteredDescriptors.rowRange(0, nkeypoints).copyTo(_descriptors);
+        }
+
         // cout << "[ORBextractor]: extracted " << _keypoints.size() << " KeyPoints" << endl;
         mAdaptiveStats.finalFeatures = nkeypoints;
         if (mAdaptiveConfig.statsEnabled)

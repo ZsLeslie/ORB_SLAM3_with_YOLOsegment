@@ -1,6 +1,6 @@
 # RGB-D 自适应静态特征补偿
 
-仅在 RGB-D / IMU-RGB-D 左图提取器启用；YOLO、人体运动判断、9×9 膨胀及后端跟踪判据保持原样。两种参数加载路径（旧 YAML 和 `File.version: "1.0"`）均支持。示例 YAML 已加入参数，默认全部关闭；开启 `FAST`、`Quota`、`Feedback` 即启用完整机制，`Stats` 独立控制日志。
+仅在 RGB-D / IMU-RGB-D 左图提取器启用；YOLO、人体运动判断、9×9 膨胀及后端跟踪判据保持原样。两种参数加载路径（旧 YAML 和 `File.version: "1.0"`）均支持。缺省配置中补偿开关全部关闭；示例 YAML 可按需开启。开启 `FAST`、`Quota`、`Feedback` 即启用完整机制，`Stats` 独立控制日志。
 
 ## 参数
 
@@ -26,6 +26,25 @@
 
 ## 提取流程
 
+`AdaptiveFeatures.FAST` 和 `AdaptiveFeatures.Quota` 均为 `0` 时，恢复提取后剔除的流程：
+
+```text
+FAST（保留原有空网格回退）→ 八叉树分配 → 方向与 ORB 描述子计算
+→ 在原图坐标下剔除掩码内特征及对应描述子行 → RGB-D 深度关联 → Tracking
+```
+
+关闭补偿的配置：
+
+```yaml
+AdaptiveFeatures.FAST: 0
+AdaptiveFeatures.Quota: 0
+AdaptiveFeatures.Feedback: 0
+```
+
+`Feedback` 仅影响已开启补偿功能的强度，`Stats` 只控制统计，两者均不改变上述过滤阶段。掩码内特征占用原始 ORB 配额后才被删除，最终点数可以明显少于 `ORBextractor.nFeatures`，不进行额外补足。YOLO、光流开关及掩码膨胀继续决定要过滤的区域。
+
+`FAST` 或 `Quota` 任一开启时，继续采用以下候选阶段过滤与补偿流程：
+
 保留原来的 iniThFAST 检测及“原始 FAST 候选为空时使用 minThFAST”回退。经现有动态掩码检查后，若静态候选少于 `MinStaticPerCell * (1 + FeedbackFastGain * strength)`，且尚未执行低阈值检测，就使用 minThFAST 补检。同一网格中以金字塔坐标去重，保留原候选，新增点也必须通过相同掩码检查。minThFAST 不低于 iniThFAST 时不执行额外补检。动态区域无法补入静态角点时允许输出不足。
 
 `rd` 是最终膨胀后动态掩码在原图范围内的并集面积比，重叠区域只计一次。静态人体不计入。Feedback 关闭或 strength=0 时：
@@ -40,7 +59,7 @@ Ntarget = round(min(Nmax, N0 * (1 + DynamicAlpha * rd)))
 Ntarget = round(min(Nmax, N0 * (1 + DynamicAlpha * rd + FeedbackQuotaGain * strength)))
 ```
 
-使用金字塔逆尺度权重分配目标，以累计舍入保证各层配额之和等于 Ntarget；不改变 `mnFeaturesPerLevel`。仍然由原八叉树选点，启用 Quota 时若节点分裂造成超额，仅裁掉该层超出配额的低响应点。所有开关关闭时保留旧算法输出（正常尺寸输入）；小尺寸金字塔层增加了空层/除零保护。
+使用金字塔逆尺度权重分配目标，以累计舍入保证各层配额之和等于 Ntarget；不改变 `mnFeaturesPerLevel`。仍然由原八叉树选点，启用 Quota 时若节点分裂造成超额，仅裁掉该层超出配额的低响应点。补偿关闭时采用上述提取后过滤路径；小尺寸金字塔层增加了空层/除零保护。
 
 候选坐标按原来的层尺度及边界偏移映射到原图。方向、描述子、最终坐标缩放和 Frame 的 RGB-D 深度关联流程不变，按实际特征数量分配数组。
 
@@ -51,7 +70,7 @@ strength 限制为 [0,1]。正常跟踪且上一帧真正执行过内点计数�
 `[AdaptiveFeatures]` 日志字段：
 
 - `frame`, `dynamic_ratio`, `strength`, `target`, `orb`：输入帧号、动态并集比例、应用强度、目标数和最终 ORB 数。
-- `static_before`, `static_after`：所有层/网格静态候选之和，前者包含原有空网格回退，后者包含新增补检去重后的候选；均在八叉树分配前计数。
+- `static_before`, `static_after`：所有层/网格静态候选之和，前者包含原有空网格回退，后者包含新增补检去重后的候选；均在八叉树分配前计数。关闭补偿时也只统计掩码外候选，但掩码内候选仍参与原始八叉树分配，直到描述子提取完成才被删除。
 - `compensated_cells`：新增低阈值补检的网格数，不包括旧回退。
 - `inliers`, `state`：该帧 Tracking 结果；未执行有效内点计数时内点记为 -1。
 - `compensation_ms`：配额/面积计算与新增 FAST、过滤、合并的直接耗时。
@@ -67,7 +86,9 @@ cmake --build build --target rgbd_tum -j2
 
 本次开发使用的临时测试源码、运行脚本及测试产物已清理，以下保留已完成的验证记录。
 
-## 本次验证记录
+## 补偿功能开发时的历史验证记录
+
+以下记录对应当时的候选阶段过滤实现；关闭补偿时的过滤顺序现已按上文改为提取后剔除。
 
 - 构建：`cmake --build build --target rgbd_tum -j2` 成功。
 - 提取器回归：以修改前提交 `c8218dc` 为基线，关闭新增功能时，关键点位置、层级、方向、响应和描述子完全一致；补检合成场景静态候选由 8042 增至 16524。
@@ -131,3 +152,5 @@ OpticalFlow.Enabled: 1  # 开启背景/人体光流及运动判定
 配置加载会校验数值类型、有限性和范围，包括整数参数、奇数窗口、置信度及 `MinBackgroundTracks <= BackgroundMaxCorners`；非法值在启动时报告对应参数错误。YOLO 分割阈值、9×9 掩码膨胀和点云深度补全参数不属于光流配置，本次保持不变。
 
 光流配置验证：完整 `rgbd_tum` 构建通过；默认参数的仿射估计、人体运动判定及匹配与改动前实现对照通过；参数覆盖和非法值校验通过。`walking_xyz` 前 30 帧分别开启/关闭光流均正常退出，各帧最终状态均为 OK；gdb 断点计数确认关闭时 LK 调用为 0，开启时存在 LK 调用。临时测试源码和产物已清理，未新增仓库测试文件。
+
+提取后剔除路径验证：`rgbd_tum` 构建通过；关闭补偿时与“无掩码完整提取后手动筛选”的参考结果逐点、逐描述子行一致，半幅掩码测试由 1003 点保留 502 点。覆盖多掩码、全遮挡、空/非法类型掩码、不同金字塔层及重叠区域分组；真实 RGB-D Frame 的描述子、深度和虚拟右目索引一致性验证通过。FAST/Quota 的三种开启组合与本次修改前输出一致。临时测试文件已清理。

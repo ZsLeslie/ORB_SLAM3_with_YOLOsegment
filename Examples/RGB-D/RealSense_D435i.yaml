@@ -72,6 +72,7 @@ Viewer.ViewpointF: 500.0
 
 # Adaptive static features (RGB-D only; independent opt-in switches).
 # Enable FAST, Quota and Feedback together to use the complete mechanism.
+# FAST=0 and Quota=0: extract complete ORB features/descriptors, then remove masked features.
 AdaptiveFeatures.FAST: 0
 AdaptiveFeatures.Quota: 0
 AdaptiveFeatures.Feedback: 0
