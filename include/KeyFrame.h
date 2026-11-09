@@ -425,6 +425,12 @@ public:
     cv::Mat mSemanticClsMap;
     cv::Mat mPersonCloudMask;
 
+    // Temporary RGB-D handoff from Tracking to LocalMapping. Pending keyframes
+    // may be deleted; dense mapping only retains them after map acceptance.
+    // These images are released on handoff and are not serialized.
+    cv::Mat mPointCloudRGB;
+    cv::Mat mPointCloudDepth;
+
     //bool mbHasHessian;
     //cv::Mat mHessianPose;
 

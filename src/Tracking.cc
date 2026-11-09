@@ -3963,9 +3963,13 @@ namespace ORB_SLAM3
         pKF->mSemanticClsMap = mCurrentFrame.mSemanticClsMap.clone();
         pKF->mPersonCloudMask = mCurrentFrame.mPersonCloudMask.clone();
 
-        mpLocalMapper->InsertKeyFrame(pKF);
+        if (mSensor == System::RGBD || mSensor == System::IMU_RGBD)
+        {
+            pKF->mPointCloudRGB = mImColor.clone();
+            pKF->mPointCloudDepth = mDepth.clone();
+        }
 
-        mpPointCloudMapper->InsertKeyFrame(pKF, this->mImColor, this->mDepth);
+        mpLocalMapper->InsertKeyFrame(pKF);
 
         mpLocalMapper->SetNotStop(false);
 

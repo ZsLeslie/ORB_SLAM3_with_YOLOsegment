@@ -3,16 +3,18 @@
 #include <iostream>
 #include <fstream>
 #include <atomic>
+#include <condition_variable>
+#include <cstddef>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <vector>
 #include <opencv2/core/core.hpp>
-#include <opencv2/highgui/highgui.hpp>
 #include <Eigen/Geometry>
-#include <boost/format.hpp>
+#include <Eigen/StdVector>
 #include <pcl/point_types.h>
-#include <pcl/io/pcd_io.h>
-#include <pcl/filters/voxel_grid.h>
-#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/point_cloud.h>
 #include "KeyFrame.h"
-#include <pcl/common/transforms.h>
 using namespace ORB_SLAM3;
 using namespace std;
 
@@ -24,9 +26,8 @@ class PointCloudMapper
 public:
     PointCloudMapper();
 
-    void InsertKeyFrame(KeyFrame* kf, cv::Mat& imRGB, cv::Mat& imDepth);
-
-    PointCloud::Ptr GeneratePointCloud(KeyFrame* kf, cv::Mat& imRGB, cv::Mat& imDepth);
+    // Submit only after LocalMapping has accepted the keyframe into its map.
+    void InsertKeyFrame(KeyFrame* kf, const cv::Mat& imRGB, const cv::Mat& imDepth);
 
     void run();
 
@@ -34,18 +35,54 @@ public:
 
     bool SaveMap(const std::string& filename) const;
 
-    queue<KeyFrame*> mqKeyFrame;
-    queue<cv::Mat> mqRGB;
-    queue<cv::Mat> mqDepth;
+    // Published clouds are immutable; readers can retain a snapshot while the
+    // mapping thread builds and publishes the next one.
+    PointCloud::ConstPtr GetGlobalMap() const;
 
-    std::mutex mmLoadKFMutex;
-    PointCloud::Ptr mpGlobalMap;
-    int mKeyFrameSize;
-    std::size_t mRejectedPersonPoints{0};
+private:
+    struct KeyFrameInput
+    {
+        KeyFrame* keyFrame = nullptr;
+        cv::Mat rgb;
+        cv::Mat depth;
+    };
 
-    std::atomic<bool> mbFinishRequested{false};
+    struct KeyFrameCloud
+    {
+        KeyFrame* keyFrame = nullptr;
+        PointCloud::ConstPtr cameraCloud;
+    };
+
+    struct CloudPose
+    {
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+        KeyFrame* keyFrame = nullptr;
+        PointCloud::ConstPtr cameraCloud;
+        Eigen::Matrix4f Twc;
+    };
+    using CloudPoses = std::vector<CloudPose, Eigen::aligned_allocator<CloudPose>>;
+
+    PointCloud::Ptr GenerateCameraPointCloud(const KeyFrame* kf,
+                                            const cv::Mat& imRGB,
+                                            const cv::Mat& imDepth);
+    CloudPoses CapturePoses() const;
+    static bool SamePoses(const CloudPoses& lhs, const CloudPoses& rhs);
+    static PointCloud::Ptr BuildGlobalMap(const CloudPoses& poses);
+    void RebuildGlobalMap(bool force);
+
+    std::queue<KeyFrameInput> mqKeyFrames;
+    std::mutex mQueueMutex;
+    std::condition_variable mQueueUpdated;
+    bool mbFinishRequested = false; // Protected by mQueueMutex.
     std::atomic<bool> mbFinished{false};
 
+    // Owned by run(); immutable after mbFinished is published.
+    std::vector<KeyFrameCloud> mvKeyFrameClouds;
+    CloudPoses mvPublishedPoses;
+    std::size_t mRejectedPersonPoints = 0;
+
+    mutable std::mutex mGlobalMapMutex;
+    PointCloud::ConstPtr mpGlobalMap;
 
 };
 

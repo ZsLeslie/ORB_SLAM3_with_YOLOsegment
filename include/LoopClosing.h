@@ -67,7 +67,8 @@ public:
     void RequestResetActiveMap(Map* pMap);
 
     // This function will run in a separate thread
-    void RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoopKF);
+    void RunGlobalBundleAdjustment(Map* pActiveMap, unsigned long nLoopKF,
+                                   unsigned long nGeneration);
 
     bool isRunningGBA(){
         unique_lock<std::mutex> lock(mMutexGBA);
@@ -152,6 +153,8 @@ protected:
 
     bool CheckFinish();
     void SetFinish();
+    // Called only on Run()'s thread, with mMutexGBA released.
+    void JoinGlobalBundleAdjustment();
     bool mbFinishRequested;
     bool mbFinished;
     std::mutex mMutexFinish;
@@ -217,13 +220,14 @@ protected:
     bool mbFinishedGBA;
     bool mbStopGBA;
     std::mutex mMutexGBA;
-    std::thread* mpThreadGBA;
+    // Owned by Run(); joined before replacement and before SetFinish().
+    std::thread mGlobalBAThread;
 
     // Fix scale in the stereo/RGB-D case
     bool mbFixScale;
 
 
-    bool mnFullBAIdx;
+    unsigned long mnFullBAIdx;
 
 
 
