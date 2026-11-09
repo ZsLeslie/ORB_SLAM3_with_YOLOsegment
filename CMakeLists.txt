@@ -43,7 +43,7 @@ message(${OpenCV_VERSION})
 
 find_package(Eigen3 REQUIRED)
 find_package(Pangolin REQUIRED)
-find_package(PCL 1.12 REQUIRED)
+find_package(PCL 1.12 REQUIRED COMPONENTS common io filters visualization)
 
 include_directories(
         ${PROJECT_SOURCE_DIR}
@@ -93,6 +93,7 @@ add_library(${PROJECT_NAME} SHARED
         src/Config.cc
         src/Settings.cc
         src/PointCloudMapper.cpp
+        src/PointCloudViewer.cpp
         include/System.h
         include/Tracking.h
         include/LocalMapping.h

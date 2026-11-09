@@ -246,6 +246,9 @@ namespace ORB_SLAM3
             mpTracker->SetViewer(mpViewer);
             mpLoopCloser->mpViewer = mpViewer;
             mpViewer->both = mpFrameDrawer->both;
+
+            if (mSensor == RGBD || mSensor == IMU_RGBD)
+                mptPointCloudViewer = new thread(&PointCloudMapper::RunViewer, mpPointCloudMapper);
         }
 
         // Fix verbosity
@@ -560,6 +563,9 @@ namespace ORB_SLAM3
         if(mptPointCloudMapping && mptPointCloudMapping->joinable() &&
            mptPointCloudMapping->get_id() != std::this_thread::get_id())
             mptPointCloudMapping->join();
+        if(mptPointCloudViewer && mptPointCloudViewer->joinable() &&
+           mptPointCloudViewer->get_id() != std::this_thread::get_id())
+            mptPointCloudViewer->join();
 
         if (!mStrSaveAtlasToFile.empty())
         {
