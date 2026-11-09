@@ -335,6 +335,17 @@ void LocalMapping::ProcessNewKeyFrame()
 
     // Insert Keyframe in Map
     mpAtlas->AddKeyFrame(mpCurrentKeyFrame);
+
+    // Only accepted keyframes have a stable lifetime. Queued keyframes can be
+    // deleted by Release()/IMU initialization before they reach this point.
+    if (!mpCurrentKeyFrame->mPointCloudRGB.empty() &&
+        !mpCurrentKeyFrame->mPointCloudDepth.empty() && mpTracker->mpPointCloudMapper)
+    {
+        mpTracker->mpPointCloudMapper->InsertKeyFrame(mpCurrentKeyFrame,
+            mpCurrentKeyFrame->mPointCloudRGB, mpCurrentKeyFrame->mPointCloudDepth);
+    }
+    mpCurrentKeyFrame->mPointCloudRGB.release();
+    mpCurrentKeyFrame->mPointCloudDepth.release();
 }
 
 void LocalMapping::EmptyQueue()

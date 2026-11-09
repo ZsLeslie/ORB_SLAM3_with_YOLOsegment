@@ -1,11 +1,30 @@
 #include "PointCloudMapper.h"
+#include "Map.h"
 
 #include <chrono>
 #include <cmath>
-#include <thread>
+#include <iostream>
+#include <utility>
+#include <pcl/common/transforms.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/io/pcd_io.h>
 
-typedef pcl::PointXYZRGB PointT;
-typedef pcl::PointCloud<PointT> PointCloud;
+namespace
+{
+// Culling freezes a keyframe's pose relative to its parent. Follow the same
+// chain used by trajectory export, so its cloud follows future parent updates.
+KeyFrame* ResolveReference(KeyFrame* keyFrame, Sophus::SE3f& Tcr)
+{
+    Tcr = Sophus::SE3f();
+    while (keyFrame && keyFrame->isBad())
+    {
+        Tcr = Tcr * keyFrame->mTcp;
+        keyFrame = keyFrame->GetParent();
+    }
+    return keyFrame;
+}
+}
 
 static cv::Vec3b GetSemanticColor(int classId)
 {
@@ -33,17 +52,36 @@ PointCloudMapper::PointCloudMapper()
     mpGlobalMap = pcl::make_shared<PointCloud>();
 }
 
-void PointCloudMapper::InsertKeyFrame(KeyFrame *kf, cv::Mat &imRGB, cv::Mat &imDepth)
+void PointCloudMapper::InsertKeyFrame(KeyFrame *kf, const cv::Mat &imRGB, const cv::Mat &imDepth)
 {
-    std::lock_guard<std::mutex> lck_loadKF(mmLoadKFMutex);
-    mqKeyFrame.push(kf);
-    mqRGB.push(imRGB.clone());
-    mqDepth.push(imDepth.clone());
+    if (!kf || imRGB.empty() || imDepth.empty())
+        return;
+
+    KeyFrameInput input;
+    input.keyFrame = kf;
+    input.rgb = imRGB.clone();
+    input.depth = imDepth.clone();
+    {
+        std::lock_guard<std::mutex> lock(mQueueMutex);
+        if (mbFinishRequested)
+            return;
+        mqKeyFrames.push(std::move(input));
+    }
+    mQueueUpdated.notify_one();
 }
 
-PointCloud::Ptr PointCloudMapper::GeneratePointCloud(KeyFrame *kf, cv::Mat &imRGB, cv::Mat &imDepth)
+PointCloud::Ptr PointCloudMapper::GenerateCameraPointCloud(const KeyFrame *kf,
+                                                         const cv::Mat &imRGB,
+                                                         const cv::Mat &imDepth)
 {
     PointCloud::Ptr pointCloud_temp(new PointCloud);
+
+    if (imRGB.type() != CV_8UC3 || imDepth.type() != CV_32FC1 ||
+        imRGB.size() != imDepth.size())
+    {
+        cerr << "Skipping dense keyframe with incompatible RGB/depth images." << endl;
+        return pointCloud_temp;
+    }
 
     for (int v = 0; v < imRGB.rows; v += 3)
     {
@@ -73,7 +111,7 @@ PointCloud::Ptr PointCloudMapper::GeneratePointCloud(KeyFrame *kf, cv::Mat &imRG
             }
 
             bool IsDynamic = false;
-            for (auto area : kf->mvDynamicArea)
+            for (const auto& area : kf->mvDynamicArea)
             {
                 if (!area.empty() && area.type() == CV_32F &&
                     pt.x >= 0 && pt.x < area.cols && pt.y >= 0 && pt.y < area.rows &&
@@ -111,59 +149,156 @@ PointCloud::Ptr PointCloudMapper::GeneratePointCloud(KeyFrame *kf, cv::Mat &imRG
         }
     }
 
-    Eigen::Isometry3d T = ORB_SLAM3::Converter::toSE3Quat(kf->GetPose());
-    PointCloud::Ptr pointCloud(new PointCloud);
-    pcl::transformPointCloud(*pointCloud_temp, *pointCloud, T.inverse().matrix());
-    pointCloud->is_dense = false;
-    return pointCloud;
+    // Keep the original camera coordinates: world coordinates are rebuilt from
+    // the latest optimized poses instead of being permanently accumulated here.
+    pointCloud_temp->is_dense = false;
+    return pointCloud_temp;
+}
+
+PointCloudMapper::CloudPoses PointCloudMapper::CapturePoses() const
+{
+    CloudPoses poses;
+    if (mvKeyFrameClouds.empty())
+        return poses;
+
+    Sophus::SE3f Tcr;
+    KeyFrame* reference = ResolveReference(mvKeyFrameClouds.back().keyFrame, Tcr);
+    Map* map = reference ? reference->GetMap() : nullptr;
+    if (!map)
+        return poses;
+
+    // Hold SLAM's update lock only while copying poses, never during the much
+    // more expensive point-cloud transforms and filtering.
+    std::unique_lock<std::mutex> lock(map->mMutexMapUpdate);
+    poses.reserve(mvKeyFrameClouds.size());
+    for (const auto& entry : mvKeyFrameClouds)
+    {
+        reference = ResolveReference(entry.keyFrame, Tcr);
+        if (!reference || reference->GetMap() != map || entry.cameraCloud->empty())
+            continue;
+
+        CloudPose pose;
+        pose.keyFrame = entry.keyFrame;
+        pose.cameraCloud = entry.cameraCloud;
+        pose.Twc = (Tcr * reference->GetPose()).inverse().matrix();
+        poses.push_back(std::move(pose));
+    }
+
+    // Separate Atlas maps have independent world frames. Only combine clouds
+    // in the map of the most recently accepted dense keyframe. After a merge,
+    // resolving the references naturally includes clouds from both old maps.
+    return poses;
+}
+
+bool PointCloudMapper::SamePoses(const CloudPoses& lhs, const CloudPoses& rhs)
+{
+    if (lhs.size() != rhs.size())
+        return false;
+    for (std::size_t i = 0; i < lhs.size(); ++i)
+    {
+        if (lhs[i].keyFrame != rhs[i].keyFrame ||
+            lhs[i].cameraCloud != rhs[i].cameraCloud ||
+            !lhs[i].Twc.isApprox(rhs[i].Twc, 1e-6f))
+            return false;
+    }
+    return true;
+}
+
+PointCloud::Ptr PointCloudMapper::BuildGlobalMap(const CloudPoses& poses)
+{
+    PointCloud::Ptr map(new PointCloud);
+    std::size_t pointCount = 0;
+    for (const auto& pose : poses)
+        pointCount += pose.cameraCloud->size();
+    map->reserve(pointCount);
+
+    PointCloud transformed;
+    for (const auto& pose : poses)
+    {
+        pcl::transformPointCloud(*pose.cameraCloud, transformed, pose.Twc);
+        *map += transformed;
+    }
+    map->is_dense = false;
+    return map;
+}
+
+void PointCloudMapper::RebuildGlobalMap(bool force)
+{
+    CloudPoses poses = CapturePoses();
+    if (!force && SamePoses(poses, mvPublishedPoses))
+        return;
+
+    PointCloud::Ptr map = BuildGlobalMap(poses);
+    {
+        std::lock_guard<std::mutex> lock(mGlobalMapMutex);
+        mpGlobalMap = map;
+    }
+    mvPublishedPoses = std::move(poses);
+}
+
+PointCloud::ConstPtr PointCloudMapper::GetGlobalMap() const
+{
+    std::lock_guard<std::mutex> lock(mGlobalMapMutex);
+    return mpGlobalMap;
 }
 
 void PointCloudMapper::run()
 {
     cout << endl
          << "PointCloudMapping thread start!" << endl;
-    int ID = 0;
+    using Clock = std::chrono::steady_clock;
+    const auto rebuildInterval = std::chrono::milliseconds(500);
+    auto nextRebuild = Clock::now();
     while (true)
     {
-        KeyFrame *kf = nullptr;
-        cv::Mat rgb, depth;
+        KeyFrameInput input;
+        bool finish = false;
 
         {
-            std::lock_guard<std::mutex> lock(mmLoadKFMutex);
-            if (!mqKeyFrame.empty())
+            std::unique_lock<std::mutex> lock(mQueueMutex);
+            mQueueUpdated.wait_until(lock, nextRebuild, [this] {
+                return mbFinishRequested || !mqKeyFrames.empty();
+            });
+            if (!mqKeyFrames.empty())
             {
-                kf = mqKeyFrame.front();
-                mqKeyFrame.pop();
-                rgb = mqRGB.front().clone();
-                mqRGB.pop();
-                depth = mqDepth.front().clone();
-                mqDepth.pop();
+                input = std::move(mqKeyFrames.front());
+                mqKeyFrames.pop();
             }
+            else
+                finish = mbFinishRequested;
         }
-        if (kf)
+        if (input.keyFrame)
         {
-            PointCloud::Ptr pointCloud_new = GeneratePointCloud(kf, rgb, depth);
-
-            ID++;
-            *mpGlobalMap += *pointCloud_new;
-            continue;
+            KeyFrameCloud entry;
+            entry.keyFrame = input.keyFrame;
+            entry.cameraCloud = GenerateCameraPointCloud(input.keyFrame, input.rgb, input.depth);
+            mvKeyFrameClouds.push_back(std::move(entry));
         }
 
-        if (mbFinishRequested.load())
+        // Check even when no new keyframes arrive, and also during a continuous
+        // stream of inputs: BA/loop corrections must not wait for an empty queue.
+        if (finish || Clock::now() >= nextRebuild)
+        {
+            RebuildGlobalMap(finish);
+            nextRebuild = Clock::now() + rebuildInterval;
+        }
+        if (finish)
             break;
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     mbFinished.store(true);
-    cout << "PointCloudMapping thread finished with " << mpGlobalMap->size()
-         << " points from " << ID << " keyframes; rejected "
+    cout << "PointCloudMapping thread finished with " << GetGlobalMap()->size()
+         << " points from " << mvPublishedPoses.size() << " keyframes; rejected "
          << mRejectedPersonPoints << " person-mask samples." << endl;
 }
 
 void PointCloudMapper::RequestFinish()
 {
-    mbFinishRequested.store(true);
+    {
+        std::lock_guard<std::mutex> lock(mQueueMutex);
+        mbFinishRequested = true;
+    }
+    mQueueUpdated.notify_one();
 }
 
 bool PointCloudMapper::SaveMap(const std::string &filename) const
@@ -174,7 +309,12 @@ bool PointCloudMapper::SaveMap(const std::string &filename) const
         return false;
     }
 
-    if (!mpGlobalMap || mpGlobalMap->empty())
+    // Re-read poses at export as well, in case a caller stopped this worker
+    // before the optimizer. System::Shutdown normally already waits for BA.
+    const CloudPoses poses = CapturePoses();
+    PointCloud::ConstPtr globalMap = SamePoses(poses, mvPublishedPoses)
+        ? GetGlobalMap() : BuildGlobalMap(poses);
+    if (!globalMap || globalMap->empty())
     {
         cerr << "Cannot save an empty point cloud map." << endl;
         return false;
@@ -187,9 +327,9 @@ bool PointCloudMapper::SaveMap(const std::string &filename) const
     {
         pcl::VoxelGrid<PointT> voxelFilter;
         voxelFilter.setLeafSize(0.01f, 0.01f, 0.01f);
-        voxelFilter.setInputCloud(mpGlobalMap);
+        voxelFilter.setInputCloud(globalMap);
         voxelFilter.filter(voxelFiltered);
-        cout << "Voxel filtering: " << mpGlobalMap->size() << " -> "
+        cout << "Voxel filtering: " << globalMap->size() << " -> "
              << voxelFiltered.size() << " points." << endl;
 
         if (voxelFiltered.empty())

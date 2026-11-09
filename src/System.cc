@@ -537,36 +537,29 @@ namespace ORB_SLAM3
 
         mpLocalMapper->RequestFinish();
         mpLoopCloser->RequestFinish();
-        if(mpPointCloudMapper)
-            mpPointCloudMapper->RequestFinish();
         if(mpViewer)
         {
             mpViewer->RequestFinish();
-            while(!mpViewer->isFinished())
-                usleep(5000);
         }
 
+        // The viewer's Stop menu can call Shutdown() on the viewer thread.
         if(mptViewer && mptViewer->joinable() && mptViewer->get_id() != std::this_thread::get_id())
             mptViewer->join();
 
+        // Finish all pose writers before the dense mapper takes its final
+        // snapshot. LoopClosing::Run also joins every global BA worker.
+        if(mptLocalMapping && mptLocalMapping->joinable() &&
+           mptLocalMapping->get_id() != std::this_thread::get_id())
+            mptLocalMapping->join();
+        if(mptLoopClosing && mptLoopClosing->joinable() &&
+           mptLoopClosing->get_id() != std::this_thread::get_id())
+            mptLoopClosing->join();
+
+        if(mpPointCloudMapper)
+            mpPointCloudMapper->RequestFinish();
         if(mptPointCloudMapping && mptPointCloudMapping->joinable() &&
            mptPointCloudMapping->get_id() != std::this_thread::get_id())
             mptPointCloudMapping->join();
-
-        // Wait until all thread have effectively stopped
-        /*while(!mpLocalMapper->isFinished() || !mpLoopCloser->isFinished() || mpLoopCloser->isRunningGBA())
-        {
-            if(!mpLocalMapper->isFinished())
-                cout << "mpLocalMapper is not finished" << endl;*/
-        /*if(!mpLoopCloser->isFinished())
-            cout << "mpLoopCloser is not finished" << endl;
-        if(mpLoopCloser->isRunningGBA()){
-            cout << "mpLoopCloser is running GBA" << endl;
-            cout << "break anyway..." << endl;
-            break;
-        }*/
-        /*usleep(5000);
-    }*/
 
         if (!mStrSaveAtlasToFile.empty())
         {
