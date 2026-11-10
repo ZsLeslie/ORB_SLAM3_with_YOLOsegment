@@ -65,6 +65,11 @@ We use [OpenCV](http://opencv.org) to manipulate images and features. Dowload an
 ## Eigen3
 Required by g2o (see below). Download and install instructions can be found at: http://eigen.tuxfamily.org. **Required at least 3.1.0**.
 
+## PCL
+PCL 1.12 or newer with the `common`, `io`, `filters` and `visualization` components is required for dense RGB-D mapping and visualization.
+
+When an RGB-D or RGB-D-inertial `System` is created with `bUseViewer=true`, a separate **ORB-SLAM3: Dense Point Cloud** window opens automatically. It displays the latest global cloud, including RGB/semantic colors and optimized keyframe poses, as the mapper publishes updates (currently every 500 ms). Use the mouse to rotate, pan and zoom. Closing this window leaves mapping running; `System::Shutdown()` closes it and waits for its thread to finish. Set `bUseViewer=false` to run without visualization windows.
+
 ## DBoW2 and g2o (Included in Thirdparty folder)
 We use modified versions of the [DBoW2](https://github.com/dorian3d/DBoW2) library to perform place recognition and [g2o](https://github.com/RainerKuemmerle/g2o) library to perform non-linear optimizations. Both modified libraries (which are BSD) are included in the *Thirdparty* folder.
 

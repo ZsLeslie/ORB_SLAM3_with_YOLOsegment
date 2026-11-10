@@ -31,6 +31,10 @@ public:
 
     void run();
 
+    // Create, update and destroy the PCL window on this dedicated thread.
+    // Closing the window leaves mapping running; finishing mapping closes it.
+    void RunViewer();
+
     void RequestFinish();
 
     bool SaveMap(const std::string& filename) const;

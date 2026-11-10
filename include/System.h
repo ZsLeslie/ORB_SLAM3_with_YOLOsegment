@@ -241,6 +241,7 @@ namespace ORB_SLAM3
         std::thread *mptLoopClosing;
         std::thread *mptViewer;
         std::thread *mptPointCloudMapping;
+        std::thread *mptPointCloudViewer = nullptr;
 
         // Reset flag
         std::mutex mMutexReset;
