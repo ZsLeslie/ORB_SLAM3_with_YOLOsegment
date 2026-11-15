@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iostream>
 #include <utility>
+#include <opencv2/calib3d.hpp>
 #include <pcl/common/transforms.h>
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/filters/voxel_grid.h>
@@ -79,9 +80,26 @@ PointCloud::Ptr PointCloudMapper::GenerateCameraPointCloud(const KeyFrame *kf,
         return pointCloud_temp;
     }
 
+    // Depth, RGB and masks share the original registered pixel coordinates.
+    // Undistort the projection rays, not the images, to match SLAM geometry.
+    std::vector<cv::Point2f> cameraRays;
+    if (!kf->mDistCoef.empty() && cv::norm(kf->mDistCoef, cv::NORM_INF) > 0.0)
+    {
+        std::vector<cv::Point2f> pixels;
+        pixels.reserve(((imRGB.rows + 2) / 3) * ((imRGB.cols + 2) / 3));
+        for (int v = 0; v < imRGB.rows; v += 3)
+            for (int u = 0; u < imRGB.cols; u += 3)
+                pixels.emplace_back(u, v);
+        const cv::Matx33f K(kf->fx, 0.0f, kf->cx,
+                           0.0f, kf->fy, kf->cy,
+                           0.0f, 0.0f, 1.0f);
+        cv::undistortPoints(pixels, cameraRays, K, kf->mDistCoef);
+    }
+
+    std::size_t sampleIndex = 0;
     for (int v = 0; v < imRGB.rows; v += 3)
     {
-        for (int u = 0; u < imRGB.cols; u += 3)
+        for (int u = 0; u < imRGB.cols; u += 3, ++sampleIndex)
         {
             cv::Point2i pt(u, v);
 
@@ -124,8 +142,16 @@ PointCloud::Ptr PointCloudMapper::GenerateCameraPointCloud(const KeyFrame *kf,
                     continue;
                 PointT p;
                 p.z = d;
-                p.x = (u - kf->cx) * p.z / kf->fx;
-                p.y = (v - kf->cy) * p.z / kf->fy;
+                if (cameraRays.empty())
+                {
+                    p.x = (u - kf->cx) * p.z / kf->fx;
+                    p.y = (v - kf->cy) * p.z / kf->fy;
+                }
+                else
+                {
+                    p.x = cameraRays[sampleIndex].x * p.z;
+                    p.y = cameraRays[sampleIndex].y * p.z;
+                }
 
                 if (cls_id >= 0)
                 {
