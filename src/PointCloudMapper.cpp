@@ -12,16 +12,12 @@
 
 namespace
 {
-// Culling freezes a keyframe's pose relative to its parent. Follow the same
-// chain used by trajectory export, so its cloud follows future parent updates.
-KeyFrame* ResolveReference(KeyFrame* keyFrame, Sophus::SE3f& Tcr)
+// Follow culled parents only to identify the latest keyframe's Atlas map.
+// Their local point clouds must not be included in the global map.
+KeyFrame* ResolveMapReference(KeyFrame* keyFrame)
 {
-    Tcr = Sophus::SE3f();
     while (keyFrame && keyFrame->isBad())
-    {
-        Tcr = Tcr * keyFrame->mTcp;
         keyFrame = keyFrame->GetParent();
-    }
     return keyFrame;
 }
 }
@@ -161,8 +157,7 @@ PointCloudMapper::CloudPoses PointCloudMapper::CapturePoses() const
     if (mvKeyFrameClouds.empty())
         return poses;
 
-    Sophus::SE3f Tcr;
-    KeyFrame* reference = ResolveReference(mvKeyFrameClouds.back().keyFrame, Tcr);
+    KeyFrame* reference = ResolveMapReference(mvKeyFrameClouds.back().keyFrame);
     Map* map = reference ? reference->GetMap() : nullptr;
     if (!map)
         return poses;
@@ -173,20 +168,23 @@ PointCloudMapper::CloudPoses PointCloudMapper::CapturePoses() const
     poses.reserve(mvKeyFrameClouds.size());
     for (const auto& entry : mvKeyFrameClouds)
     {
-        reference = ResolveReference(entry.keyFrame, Tcr);
-        if (!reference || reference->GetMap() != map || entry.cameraCloud->empty())
+        // Recheck on every snapshot: culling can happen after this cloud has
+        // already been fused, including while no new keyframes are arriving.
+        KeyFrame* keyFrame = entry.keyFrame;
+        if (!keyFrame || keyFrame->isBad() ||
+            keyFrame->GetMap() != map || entry.cameraCloud->empty())
             continue;
 
         CloudPose pose;
-        pose.keyFrame = entry.keyFrame;
+        pose.keyFrame = keyFrame;
         pose.cameraCloud = entry.cameraCloud;
-        pose.Twc = (Tcr * reference->GetPose()).inverse().matrix();
+        pose.Twc = keyFrame->GetPoseInverse().matrix();
         poses.push_back(std::move(pose));
     }
 
     // Separate Atlas maps have independent world frames. Only combine clouds
-    // in the map of the most recently accepted dense keyframe. After a merge,
-    // resolving the references naturally includes clouds from both old maps.
+    // from valid keyframes in the map of the latest accepted dense keyframe.
+    // After a merge, valid keyframes' updated map pointers include both maps.
     return poses;
 }
 
