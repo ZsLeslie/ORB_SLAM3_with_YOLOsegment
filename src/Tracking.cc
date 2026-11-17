@@ -830,7 +830,13 @@ namespace ORB_SLAM3
         mpCamera = settings->camera1();
         mpCamera = mpAtlas->AddCamera(mpCamera);
 
-        if (settings->needToUndistort())
+        // RGB-D keeps registered RGB/depth pixels in their original images,
+        // but feature coordinates must still use the configured distortion.
+        const bool bDistortedRGBD =
+            (mSensor == System::RGBD || mSensor == System::IMU_RGBD) &&
+            settings->cameraType() == Settings::PinHole &&
+            !settings->camera1DistortionCoef().empty();
+        if (settings->needToUndistort() || bDistortedRGBD)
         {
             mDistCoef = settings->camera1DistortionCoef();
         }

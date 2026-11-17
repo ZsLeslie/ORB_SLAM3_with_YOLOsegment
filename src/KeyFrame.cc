@@ -757,8 +757,8 @@ bool KeyFrame::UnprojectStereo(int i, Eigen::Vector3f &x3D)
     const float z = mvDepth[i];
     if(z>0)
     {
-        const float u = mvKeys[i].pt.x;
-        const float v = mvKeys[i].pt.y;
+        const float u = mvKeysUn[i].pt.x;
+        const float v = mvKeysUn[i].pt.y;
         const float x = (u-cx)*z*invfx;
         const float y = (v-cy)*z*invfy;
         Eigen::Vector3f x3Dc(x, y, z);

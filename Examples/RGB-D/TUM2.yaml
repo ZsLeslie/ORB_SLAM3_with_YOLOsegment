@@ -32,8 +32,9 @@ Camera.RGB: 1
 Stereo.ThDepth: 40.0
 Stereo.b: 0.0767
 
-# Depth map values factor
-RGBD.DepthMapFactor: 5208.0
+# TUM's registered 16-bit PNG depths already include the dataset correction:
+# 5000 raw units = 1 metre. Do not apply a second depth correction.
+RGBD.DepthMapFactor: 5000.0
 
 
 #--------------------------------------------------------------------------------------------

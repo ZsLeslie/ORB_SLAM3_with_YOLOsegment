@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iostream>
 #include <utility>
+#include <opencv2/calib3d.hpp>
 #include <pcl/common/transforms.h>
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/filters/voxel_grid.h>
@@ -12,16 +13,12 @@
 
 namespace
 {
-// Culling freezes a keyframe's pose relative to its parent. Follow the same
-// chain used by trajectory export, so its cloud follows future parent updates.
-KeyFrame* ResolveReference(KeyFrame* keyFrame, Sophus::SE3f& Tcr)
+// Follow culled parents only to identify the latest keyframe's Atlas map.
+// Their local point clouds must not be included in the global map.
+KeyFrame* ResolveMapReference(KeyFrame* keyFrame)
 {
-    Tcr = Sophus::SE3f();
     while (keyFrame && keyFrame->isBad())
-    {
-        Tcr = Tcr * keyFrame->mTcp;
         keyFrame = keyFrame->GetParent();
-    }
     return keyFrame;
 }
 }
@@ -83,9 +80,26 @@ PointCloud::Ptr PointCloudMapper::GenerateCameraPointCloud(const KeyFrame *kf,
         return pointCloud_temp;
     }
 
+    // Depth, RGB and masks share the original registered pixel coordinates.
+    // Undistort the projection rays, not the images, to match SLAM geometry.
+    std::vector<cv::Point2f> cameraRays;
+    if (!kf->mDistCoef.empty() && cv::norm(kf->mDistCoef, cv::NORM_INF) > 0.0)
+    {
+        std::vector<cv::Point2f> pixels;
+        pixels.reserve(((imRGB.rows + 2) / 3) * ((imRGB.cols + 2) / 3));
+        for (int v = 0; v < imRGB.rows; v += 3)
+            for (int u = 0; u < imRGB.cols; u += 3)
+                pixels.emplace_back(u, v);
+        const cv::Matx33f K(kf->fx, 0.0f, kf->cx,
+                           0.0f, kf->fy, kf->cy,
+                           0.0f, 0.0f, 1.0f);
+        cv::undistortPoints(pixels, cameraRays, K, kf->mDistCoef);
+    }
+
+    std::size_t sampleIndex = 0;
     for (int v = 0; v < imRGB.rows; v += 3)
     {
-        for (int u = 0; u < imRGB.cols; u += 3)
+        for (int u = 0; u < imRGB.cols; u += 3, ++sampleIndex)
         {
             cv::Point2i pt(u, v);
 
@@ -128,8 +142,16 @@ PointCloud::Ptr PointCloudMapper::GenerateCameraPointCloud(const KeyFrame *kf,
                     continue;
                 PointT p;
                 p.z = d;
-                p.x = (u - kf->cx) * p.z / kf->fx;
-                p.y = (v - kf->cy) * p.z / kf->fy;
+                if (cameraRays.empty())
+                {
+                    p.x = (u - kf->cx) * p.z / kf->fx;
+                    p.y = (v - kf->cy) * p.z / kf->fy;
+                }
+                else
+                {
+                    p.x = cameraRays[sampleIndex].x * p.z;
+                    p.y = cameraRays[sampleIndex].y * p.z;
+                }
 
                 if (cls_id >= 0)
                 {
@@ -161,8 +183,7 @@ PointCloudMapper::CloudPoses PointCloudMapper::CapturePoses() const
     if (mvKeyFrameClouds.empty())
         return poses;
 
-    Sophus::SE3f Tcr;
-    KeyFrame* reference = ResolveReference(mvKeyFrameClouds.back().keyFrame, Tcr);
+    KeyFrame* reference = ResolveMapReference(mvKeyFrameClouds.back().keyFrame);
     Map* map = reference ? reference->GetMap() : nullptr;
     if (!map)
         return poses;
@@ -173,20 +194,23 @@ PointCloudMapper::CloudPoses PointCloudMapper::CapturePoses() const
     poses.reserve(mvKeyFrameClouds.size());
     for (const auto& entry : mvKeyFrameClouds)
     {
-        reference = ResolveReference(entry.keyFrame, Tcr);
-        if (!reference || reference->GetMap() != map || entry.cameraCloud->empty())
+        // Recheck on every snapshot: culling can happen after this cloud has
+        // already been fused, including while no new keyframes are arriving.
+        KeyFrame* keyFrame = entry.keyFrame;
+        if (!keyFrame || keyFrame->isBad() ||
+            keyFrame->GetMap() != map || entry.cameraCloud->empty())
             continue;
 
         CloudPose pose;
-        pose.keyFrame = entry.keyFrame;
+        pose.keyFrame = keyFrame;
         pose.cameraCloud = entry.cameraCloud;
-        pose.Twc = (Tcr * reference->GetPose()).inverse().matrix();
+        pose.Twc = keyFrame->GetPoseInverse().matrix();
         poses.push_back(std::move(pose));
     }
 
     // Separate Atlas maps have independent world frames. Only combine clouds
-    // in the map of the most recently accepted dense keyframe. After a merge,
-    // resolving the references naturally includes clouds from both old maps.
+    // from valid keyframes in the map of the latest accepted dense keyframe.
+    // After a merge, valid keyframes' updated map pointers include both maps.
     return poses;
 }
 
