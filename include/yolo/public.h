@@ -89,6 +89,10 @@ __inline__ size_t dataTypeToSize(DataType dataType)
 // get the string of a TensorRT shape
 __inline__ std::string shapeToString(Dims32 dim)
 {
+    if (dim.nbDims < 0)
+    {
+        return "(invalid)";
+    }
     std::string output("(");
     if (dim.nbDims == 0)
     {

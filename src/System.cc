@@ -188,7 +188,7 @@ namespace ORB_SLAM3
         mpMapDrawer = new MapDrawer(mpAtlas, strSettingsFile, settings_);
 
         // yolo
-        mpYoloDetector = new YoloDetector("./model/yolo11s-seg.engine");
+        mpYoloDetector = new YoloDetector(kYoloEngineFile);
 
         // Initialize the Tracking thread
         //(it will live in the main thread of execution, the one that called this constructor)

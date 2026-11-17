@@ -154,3 +154,7 @@ __pycache__/
 
 # Generated TensorRT engines
 *.engine
+
+# Local segmentation model assets and calibration caches
+/model/*.onnx
+/model/*.cache

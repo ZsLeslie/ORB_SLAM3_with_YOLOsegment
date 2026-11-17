@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 2.8)
-project(ORB_SLAM3 LANGUAGES CXX CUDA)
+cmake_minimum_required(VERSION 3.17)
+project(ORB_SLAM3 LANGUAGES C CXX CUDA)
 
 set(CMAKE_CUDA_ARCHITECTURES 86)
 
@@ -44,6 +44,21 @@ message(${OpenCV_VERSION})
 find_package(Eigen3 REQUIRED)
 find_package(Pangolin REQUIRED)
 find_package(PCL 1.12 REQUIRED COMPONENTS common io filters visualization)
+find_package(CUDAToolkit REQUIRED)
+
+set(TENSORRT_ROOT "/home/leslie/TensorRT-8.6.1.6" CACHE PATH "TensorRT 8.x installation directory")
+find_path(TENSORRT_INCLUDE_DIR NvInfer.h
+        HINTS ${TENSORRT_ROOT} $ENV{TENSORRT_ROOT}
+        PATH_SUFFIXES include include/x86_64-linux-gnu include/aarch64-linux-gnu)
+find_library(TENSORRT_LIBRARY nvinfer
+        HINTS ${TENSORRT_ROOT} $ENV{TENSORRT_ROOT}
+        PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu lib/aarch64-linux-gnu)
+find_library(TENSORRT_ONNX_LIBRARY nvonnxparser
+        HINTS ${TENSORRT_ROOT} $ENV{TENSORRT_ROOT}
+        PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu lib/aarch64-linux-gnu)
+if(NOT TENSORRT_INCLUDE_DIR OR NOT TENSORRT_LIBRARY OR NOT TENSORRT_ONNX_LIBRARY)
+        message(FATAL_ERROR "TensorRT 8.x not found. Set -DTENSORRT_ROOT=/path/to/TensorRT-8.x")
+endif()
 
 include_directories(
         ${PROJECT_SOURCE_DIR}
@@ -53,8 +68,8 @@ include_directories(
         ${EIGEN3_INCLUDE_DIR}
         ${Pangolin_INCLUDE_DIRS}
         ${PCL_INCLUDE_DIRS}
-        /usr/local/cuda-11.7/include
-        /home/leslie/TensorRT-8.6.1.6/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+        ${TENSORRT_INCLUDE_DIR}
 )
 
 link_directories(
@@ -62,6 +77,28 @@ link_directories(
 )
 
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR}/lib)
+
+# Build the detector and its consumers with the same YoloDetector definition.
+add_library(yolo_infer SHARED
+        src/yolo/infer.cpp
+        src/yolo/calibrator.cpp
+        src/yolo/preprocess.cu
+        src/yolo/postprocess.cu
+        src/yolo/draw.cu)
+target_include_directories(yolo_infer PUBLIC
+        ${PROJECT_SOURCE_DIR}/include/yolo
+        ${OpenCV_INCLUDE_DIRS}
+        ${TENSORRT_INCLUDE_DIR})
+target_link_libraries(yolo_infer PUBLIC
+        ${OpenCV_LIBS}
+        CUDA::cudart
+        ${TENSORRT_LIBRARY}
+        PRIVATE ${TENSORRT_ONNX_LIBRARY})
+set_target_properties(yolo_infer PROPERTIES
+        CXX_STANDARD 14
+        CXX_STANDARD_REQUIRED YES
+        CUDA_STANDARD 14
+        CUDA_STANDARD_REQUIRED YES)
 
 add_library(${PROJECT_NAME} SHARED
         src/System.cc
@@ -136,7 +173,7 @@ target_link_libraries(${PROJECT_NAME}
         ${PCL_LIBRARIES}
         -lboost_serialization
         -lcrypto
-        libyolo_infer.so
+        yolo_infer
 )
 # Build examples
 

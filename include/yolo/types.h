@@ -3,6 +3,7 @@
 
 #include <string>
 #include <vector>
+#include "config.h"
 
 
 struct Detection
@@ -11,7 +12,7 @@ struct Detection
     float bbox[4];
     float conf;
     int classId;
-    float mask[32];  // mask coefficient
+    float mask[kNumMasks];  // mask coefficient
     std::vector<float> maskMatrix;  // 2D mask after mask coefficient multiply proto, and scale to original image
 };
 
