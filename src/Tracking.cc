@@ -3000,6 +3000,7 @@ namespace ORB_SLAM3
 
             // Create KeyFrame
             KeyFrame *pKFini = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
+            CopyKeyFramePointCloudInput(pKFini);
 
             // Insert KeyFrame in the map
             mpAtlas->AddKeyFrame(pKFini);
@@ -3841,6 +3842,22 @@ namespace ORB_SLAM3
             return false;
     }
 
+    void Tracking::CopyKeyFramePointCloudInput(KeyFrame *keyFrame) const
+    {
+        keyFrame->mvDynamicArea.clear();
+        for (const auto &mask : mCurrentFrame.mvDynamicArea)
+            keyFrame->mvDynamicArea.push_back(mask.clone());
+
+        keyFrame->mSemanticClsMap = mCurrentFrame.mSemanticClsMap.clone();
+        keyFrame->mPersonCloudMask = mCurrentFrame.mPersonCloudMask.clone();
+
+        if (mSensor == System::RGBD || mSensor == System::IMU_RGBD)
+        {
+            keyFrame->mPointCloudRGB = mImColor.clone();
+            keyFrame->mPointCloudDepth = mDepth.clone();
+        }
+    }
+
     void Tracking::CreateNewKeyFrame()
     {
         if (mpLocalMapper->IsInitializing() && !mpAtlas->isImuInitialized())
@@ -3962,18 +3979,7 @@ namespace ORB_SLAM3
             }
         }
 
-        pKF->mvDynamicArea.clear();
-        for (const auto &m : mCurrentFrame.mvDynamicArea)
-            pKF->mvDynamicArea.push_back(m.clone());
-
-        pKF->mSemanticClsMap = mCurrentFrame.mSemanticClsMap.clone();
-        pKF->mPersonCloudMask = mCurrentFrame.mPersonCloudMask.clone();
-
-        if (mSensor == System::RGBD || mSensor == System::IMU_RGBD)
-        {
-            pKF->mPointCloudRGB = mImColor.clone();
-            pKF->mPointCloudDepth = mDepth.clone();
-        }
+        CopyKeyFramePointCloudInput(pKF);
 
         mpLocalMapper->InsertKeyFrame(pKF);
 

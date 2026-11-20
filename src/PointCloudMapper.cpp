@@ -1,6 +1,8 @@
 #include "PointCloudMapper.h"
 #include "Map.h"
+#include "PointCloudChangeDetector.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -8,7 +10,6 @@
 #include <opencv2/calib3d.hpp>
 #include <pcl/common/transforms.h>
 #include <pcl/filters/statistical_outlier_removal.h>
-#include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 
 namespace
@@ -214,45 +215,47 @@ PointCloudMapper::CloudPoses PointCloudMapper::CapturePoses() const
     return poses;
 }
 
-bool PointCloudMapper::SamePoses(const CloudPoses& lhs, const CloudPoses& rhs)
+std::size_t PointCloudMapper::CommonPosePrefix(const CloudPoses& lhs, const CloudPoses& rhs)
 {
-    if (lhs.size() != rhs.size())
-        return false;
-    for (std::size_t i = 0; i < lhs.size(); ++i)
+    const std::size_t limit = std::min(lhs.size(), rhs.size());
+    for (std::size_t i = 0; i < limit; ++i)
     {
         if (lhs[i].keyFrame != rhs[i].keyFrame ||
             lhs[i].cameraCloud != rhs[i].cameraCloud ||
-            !lhs[i].Twc.isApprox(rhs[i].Twc, 1e-6f))
-            return false;
+            lhs[i].Twc != rhs[i].Twc)
+            return i;
     }
-    return true;
+    return limit;
 }
 
-PointCloud::Ptr PointCloudMapper::BuildGlobalMap(const CloudPoses& poses)
+void PointCloudMapper::FuseKeyFrames(const CloudPoses& poses, PointCloudChangeDetector& detector,
+                                    std::vector<std::size_t>& pointOffsets)
 {
-    PointCloud::Ptr map(new PointCloud);
-    std::size_t pointCount = 0;
-    for (const auto& pose : poses)
-        pointCount += pose.cameraCloud->size();
-    map->reserve(pointCount);
-
     PointCloud transformed;
-    for (const auto& pose : poses)
+    for (std::size_t i = pointOffsets.size(); i < poses.size(); ++i)
     {
+        const auto& pose = poses[i];
         pcl::transformPointCloud(*pose.cameraCloud, transformed, pose.Twc);
-        *map += transformed;
+        detector.AppendChanges(transformed);
+        pointOffsets.push_back(detector.GetCloud().size());
     }
-    map->is_dense = false;
-    return map;
 }
 
-void PointCloudMapper::RebuildGlobalMap(bool force)
+void PointCloudMapper::RebuildGlobalMap(PointCloudChangeDetector& detector,
+                                       std::vector<std::size_t>& pointOffsets)
 {
     CloudPoses poses = CapturePoses();
-    if (!force && SamePoses(poses, mvPublishedPoses))
+    const std::size_t prefix = CommonPosePrefix(poses, mvPublishedPoses);
+    if (prefix == poses.size() && prefix == mvPublishedPoses.size())
         return;
 
-    PointCloud::Ptr map = BuildGlobalMap(poses);
+    // Each decision depends on every earlier contribution in the same map.
+    // Reprocess the suffix after a corrected, removed or newly visible frame.
+    detector.Truncate(prefix == 0 ? 0 : pointOffsets[prefix - 1]);
+    pointOffsets.resize(prefix);
+    FuseKeyFrames(poses, detector, pointOffsets);
+
+    const auto map = pcl::make_shared<PointCloud>(detector.GetCloud());
     {
         std::lock_guard<std::mutex> lock(mGlobalMapMutex);
         mpGlobalMap = map;
@@ -273,6 +276,8 @@ void PointCloudMapper::run()
     using Clock = std::chrono::steady_clock;
     const auto rebuildInterval = std::chrono::milliseconds(500);
     auto nextRebuild = Clock::now();
+    PointCloudChangeDetector detector;
+    std::vector<std::size_t> pointOffsets;
     while (true)
     {
         KeyFrameInput input;
@@ -303,7 +308,7 @@ void PointCloudMapper::run()
         // stream of inputs: BA/loop corrections must not wait for an empty queue.
         if (finish || Clock::now() >= nextRebuild)
         {
-            RebuildGlobalMap(finish);
+            RebuildGlobalMap(detector, pointOffsets);
             nextRebuild = Clock::now() + rebuildInterval;
         }
         if (finish)
@@ -336,38 +341,31 @@ bool PointCloudMapper::SaveMap(const std::string &filename) const
     // Re-read poses at export as well, in case a caller stopped this worker
     // before the optimizer. System::Shutdown normally already waits for BA.
     const CloudPoses poses = CapturePoses();
-    PointCloud::ConstPtr globalMap = SamePoses(poses, mvPublishedPoses)
-        ? GetGlobalMap() : BuildGlobalMap(poses);
+    PointCloud::ConstPtr globalMap = GetGlobalMap();
+    if (poses.size() != mvPublishedPoses.size() ||
+        CommonPosePrefix(poses, mvPublishedPoses) != poses.size())
+    {
+        PointCloudChangeDetector detector;
+        std::vector<std::size_t> pointOffsets;
+        FuseKeyFrames(poses, detector, pointOffsets);
+        globalMap = pcl::make_shared<PointCloud>(detector.GetCloud());
+    }
     if (!globalMap || globalMap->empty())
     {
         cerr << "Cannot save an empty point cloud map." << endl;
         return false;
     }
 
-    PointCloud voxelFiltered;
     PointCloud statisticalFiltered;
 
     try
     {
-        pcl::VoxelGrid<PointT> voxelFilter;
-        voxelFilter.setLeafSize(0.01f, 0.01f, 0.01f);
-        voxelFilter.setInputCloud(globalMap);
-        voxelFilter.filter(voxelFiltered);
-        cout << "Voxel filtering: " << globalMap->size() << " -> "
-             << voxelFiltered.size() << " points." << endl;
-
-        if (voxelFiltered.empty())
-        {
-            cerr << "Voxel filtering produced an empty point cloud." << endl;
-            return false;
-        }
-
         pcl::StatisticalOutlierRemoval<PointT> statisticalFilter;
         statisticalFilter.setMeanK(100);
         statisticalFilter.setStddevMulThresh(1.0);
-        statisticalFilter.setInputCloud(voxelFiltered.makeShared());
+        statisticalFilter.setInputCloud(globalMap);
         statisticalFilter.filter(statisticalFiltered);
-        cout << "Statistical filtering: " << voxelFiltered.size() << " -> "
+        cout << "Statistical filtering: " << globalMap->size() << " -> "
              << statisticalFiltered.size() << " points." << endl;
     }
     catch (const std::exception &e)

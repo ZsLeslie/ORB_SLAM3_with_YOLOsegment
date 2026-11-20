@@ -21,6 +21,8 @@ using namespace std;
 typedef pcl::PointXYZRGB PointT;
 typedef pcl::PointCloud<PointT> PointCloud;
 
+class PointCloudChangeDetector;
+
 class PointCloudMapper
 {
 public:
@@ -70,9 +72,11 @@ private:
                                             const cv::Mat& imRGB,
                                             const cv::Mat& imDepth);
     CloudPoses CapturePoses() const;
-    static bool SamePoses(const CloudPoses& lhs, const CloudPoses& rhs);
-    static PointCloud::Ptr BuildGlobalMap(const CloudPoses& poses);
-    void RebuildGlobalMap(bool force);
+    static std::size_t CommonPosePrefix(const CloudPoses& lhs, const CloudPoses& rhs);
+    static void FuseKeyFrames(const CloudPoses& poses, PointCloudChangeDetector& detector,
+                              std::vector<std::size_t>& pointOffsets);
+    void RebuildGlobalMap(PointCloudChangeDetector& detector,
+                          std::vector<std::size_t>& pointOffsets);
 
     std::queue<KeyFrameInput> mqKeyFrames;
     std::mutex mQueueMutex;

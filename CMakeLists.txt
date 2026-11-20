@@ -129,6 +129,7 @@ add_library(${PROJECT_NAME} SHARED
         src/TwoViewReconstruction.cc
         src/Config.cc
         src/Settings.cc
+        src/PointCloudChangeDetector.cpp
         src/PointCloudMapper.cpp
         src/PointCloudViewer.cpp
         include/System.h

@@ -266,6 +266,7 @@ namespace ORB_SLAM3
 
         bool NeedNewKeyFrame();
         void CreateNewKeyFrame();
+        void CopyKeyFramePointCloudInput(KeyFrame* keyFrame) const;
 
         // Perform preintegration from last frame
         void PreintegrateIMU();
