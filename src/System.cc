@@ -71,6 +71,7 @@ namespace ORB_SLAM3
             cerr << "Failed to open settings file at: " << strSettingsFile << endl;
             exit(-1);
         }
+        auto pointCloudMapper = PointCloudMapper::FromSettings(fsSettings);
 
         cv::FileNode node = fsSettings["File.version"];
         if (!node.empty() && node.isString() && node.string() == "1.0")
@@ -197,7 +198,7 @@ namespace ORB_SLAM3
                                  mpAtlas, mpKeyFrameDatabase, strSettingsFile, mSensor, settings_, strSequence);
 
         mpTracker->SetYoloDetector(mpYoloDetector);
-        mpPointCloudMapper = new PointCloudMapper();
+        mpPointCloudMapper = pointCloudMapper.release();
 
         mpTracker->mpPointCloudMapper = mpPointCloudMapper;
 

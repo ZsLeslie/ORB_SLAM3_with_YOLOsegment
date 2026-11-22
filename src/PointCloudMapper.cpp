@@ -1,18 +1,22 @@
 #include "PointCloudMapper.h"
+#include "DensePointCloudFusion.h"
 #include "Map.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <stdexcept>
 #include <utility>
 #include <opencv2/calib3d.hpp>
-#include <pcl/common/transforms.h>
 #include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 
 namespace
 {
+constexpr int kSampleStep = 3;
+
 // Follow culled parents only to identify the latest keyframe's Atlas map.
 // Their local point clouds must not be included in the global map.
 KeyFrame* ResolveMapReference(KeyFrame* keyFrame)
@@ -20,6 +24,43 @@ KeyFrame* ResolveMapReference(KeyFrame* keyFrame)
     while (keyFrame && keyFrame->isBad())
         keyFrame = keyFrame->GetParent();
     return keyFrame;
+}
+
+void ComputeCameraNormals(std::vector<DensePointSample>& samples, int rows, int cols)
+{
+    for (int row = 0; row < rows; ++row)
+        for (int col = 0; col < cols; ++col)
+        {
+            DensePointSample& center = samples[row * cols + col];
+            if (center.position.z() <= 0.0f)
+                continue;
+
+            const float depthThreshold = std::max(0.025f, 0.015f * center.position.z());
+            // Wider differences reduce normal jitter. Stop at invalid samples
+            // or depth edges and use one-sided differences at holes.
+            const auto neighbor = [&](int dv, int du) -> const Eigen::Vector3f& {
+                const Eigen::Vector3f* last = &center.position;
+                for (int step = 1; step <= 2; ++step)
+                {
+                    const int v = row + step * dv;
+                    const int u = col + step * du;
+                    if (v < 0 || v >= rows || u < 0 || u >= cols)
+                        break;
+                    const auto& candidate = samples[v * cols + u].position;
+                    if (candidate.z() <= 0.0f ||
+                        std::abs(candidate.z() - last->z()) > depthThreshold)
+                        break;
+                    last = &candidate;
+                }
+                return *last;
+            };
+            const Eigen::Vector3f across = neighbor(0, 1) - neighbor(0, -1);
+            const Eigen::Vector3f down = neighbor(1, 0) - neighbor(-1, 0);
+            const Eigen::Vector3f normal = across.cross(down);
+            const float norm = normal.norm();
+            if (norm > 1e-8f && std::isfinite(norm))
+                center.normal = normal / (normal.dot(center.position) > 0.0f ? -norm : norm);
+        }
 }
 }
 
@@ -44,9 +85,36 @@ static cv::Vec3b GetSemanticColor(int classId)
     }
 }
 
-PointCloudMapper::PointCloudMapper()
+PointCloudMapper::PointCloudMapper(FusionMode mode, float voxelSize)
+    : mFusionMode(mode), mVoxelSize(voxelSize)
 {
+    if (!std::isfinite(voxelSize) || voxelSize < 0.001f || voxelSize > 1.0f)
+        throw std::invalid_argument("DenseMapping.VoxelSize must be between 0.001 and 1.0 metres");
     mpGlobalMap = pcl::make_shared<PointCloud>();
+}
+
+std::unique_ptr<PointCloudMapper> PointCloudMapper::FromSettings(const cv::FileStorage& settings)
+{
+    FusionMode mode = FusionMode::Voxel;
+    const cv::FileNode fusion = settings["DenseMapping.Fusion"];
+    if (!fusion.empty())
+    {
+        if (!fusion.isString())
+            throw std::invalid_argument("DenseMapping.Fusion must be a string");
+        const std::string name = fusion.string();
+        if (name == "concat")
+            mode = FusionMode::Concatenate;
+        else if (name == "kalman")
+            mode = FusionMode::Kalman;
+        else if (name != "voxel")
+            throw std::invalid_argument("DenseMapping.Fusion must be concat, voxel, or kalman");
+    }
+    const cv::FileNode voxelSize = settings["DenseMapping.VoxelSize"];
+    if (!voxelSize.empty() && !voxelSize.isInt() && !voxelSize.isReal())
+        throw std::invalid_argument("DenseMapping.VoxelSize must be numeric");
+    if (voxelSize.empty())
+        return std::make_unique<PointCloudMapper>(mode);
+    return std::make_unique<PointCloudMapper>(mode, static_cast<float>(voxelSize));
 }
 
 void PointCloudMapper::InsertKeyFrame(KeyFrame *kf, const cv::Mat &imRGB, const cv::Mat &imDepth)
@@ -67,18 +135,22 @@ void PointCloudMapper::InsertKeyFrame(KeyFrame *kf, const cv::Mat &imRGB, const 
     mQueueUpdated.notify_one();
 }
 
-PointCloud::Ptr PointCloudMapper::GenerateCameraPointCloud(const KeyFrame *kf,
-                                                         const cv::Mat &imRGB,
-                                                         const cv::Mat &imDepth)
+std::shared_ptr<const DensePointCloudFrame> PointCloudMapper::GenerateCameraPointCloud(
+    const KeyFrame* kf, const cv::Mat& imRGB, const cv::Mat& imDepth)
 {
-    PointCloud::Ptr pointCloud_temp(new PointCloud);
+    auto frame = std::make_shared<DensePointCloudFrame>();
 
     if (imRGB.type() != CV_8UC3 || imDepth.type() != CV_32FC1 ||
         imRGB.size() != imDepth.size())
     {
         cerr << "Skipping dense keyframe with incompatible RGB/depth images." << endl;
-        return pointCloud_temp;
+        return frame;
     }
+
+    const int rows = (imRGB.rows + kSampleStep - 1) / kSampleStep;
+    const int cols = (imRGB.cols + kSampleStep - 1) / kSampleStep;
+    std::vector<DensePointSample>& samples = frame->samples;
+    samples.resize(static_cast<std::size_t>(rows) * cols);
 
     // Depth, RGB and masks share the original registered pixel coordinates.
     // Undistort the projection rays, not the images, to match SLAM geometry.
@@ -86,9 +158,9 @@ PointCloud::Ptr PointCloudMapper::GenerateCameraPointCloud(const KeyFrame *kf,
     if (!kf->mDistCoef.empty() && cv::norm(kf->mDistCoef, cv::NORM_INF) > 0.0)
     {
         std::vector<cv::Point2f> pixels;
-        pixels.reserve(((imRGB.rows + 2) / 3) * ((imRGB.cols + 2) / 3));
-        for (int v = 0; v < imRGB.rows; v += 3)
-            for (int u = 0; u < imRGB.cols; u += 3)
+        pixels.reserve(samples.size());
+        for (int v = 0; v < imRGB.rows; v += kSampleStep)
+            for (int u = 0; u < imRGB.cols; u += kSampleStep)
                 pixels.emplace_back(u, v);
         const cv::Matx33f K(kf->fx, 0.0f, kf->cx,
                            0.0f, kf->fy, kf->cy,
@@ -97,9 +169,9 @@ PointCloud::Ptr PointCloudMapper::GenerateCameraPointCloud(const KeyFrame *kf,
     }
 
     std::size_t sampleIndex = 0;
-    for (int v = 0; v < imRGB.rows; v += 3)
+    for (int v = 0; v < imRGB.rows; v += kSampleStep)
     {
-        for (int u = 0; u < imRGB.cols; u += 3, ++sampleIndex)
+        for (int u = 0; u < imRGB.cols; u += kSampleStep, ++sampleIndex)
         {
             cv::Point2i pt(u, v);
 
@@ -135,46 +207,30 @@ PointCloud::Ptr PointCloudMapper::GenerateCameraPointCloud(const KeyFrame *kf,
                     break;
                 }
             }
-            if (!IsDynamic)
-            {
-                float d = imDepth.ptr<float>(v)[u];
-                if (d <= 0.0f || !std::isfinite(d))
-                    continue;
-                PointT p;
-                p.z = d;
-                if (cameraRays.empty())
-                {
-                    p.x = (u - kf->cx) * p.z / kf->fx;
-                    p.y = (v - kf->cy) * p.z / kf->fy;
-                }
-                else
-                {
-                    p.x = cameraRays[sampleIndex].x * p.z;
-                    p.y = cameraRays[sampleIndex].y * p.z;
-                }
+            const float depth = imDepth.ptr<float>(v)[u];
+            if (IsDynamic || depth <= 0.0f || !std::isfinite(depth))
+                continue;
 
-                if (cls_id >= 0)
-                {
-                    cv::Vec3b semColor = GetSemanticColor(cls_id);
-                    p.b = semColor[0];
-                    p.g = semColor[1];
-                    p.r = semColor[2];
-                }
-                else
-                {
-                    p.b = imRGB.ptr<cv::Vec3b>(v)[u][0];
-                    p.g = imRGB.ptr<cv::Vec3b>(v)[u][1];
-                    p.r = imRGB.ptr<cv::Vec3b>(v)[u][2];
-                }
-                pointCloud_temp->push_back(p);
-            }
+            const float x = cameraRays.empty() ? (u - kf->cx) * depth / kf->fx
+                                               : cameraRays[sampleIndex].x * depth;
+            const float y = cameraRays.empty() ? (v - kf->cy) * depth / kf->fy
+                                               : cameraRays[sampleIndex].y * depth;
+            if (!std::isfinite(x) || !std::isfinite(y))
+                continue;
+
+            DensePointSample& sample = samples[sampleIndex];
+            sample.position = Eigen::Vector3f(x, y, depth);
+            sample.classId = cls_id;
+            sample.bgr = cls_id >= 0 ? GetSemanticColor(cls_id) : imRGB.ptr<cv::Vec3b>(v)[u];
         }
     }
 
-    // Keep the original camera coordinates: world coordinates are rebuilt from
-    // the latest optimized poses instead of being permanently accumulated here.
-    pointCloud_temp->is_dense = false;
-    return pointCloud_temp;
+    if (mFusionMode != FusionMode::Concatenate)
+        ComputeCameraNormals(samples, rows, cols);
+    samples.erase(std::remove_if(samples.begin(), samples.end(), [](const DensePointSample& sample) {
+        return sample.position.z() <= 0.0f;
+    }), samples.end());
+    return frame;
 }
 
 PointCloudMapper::CloudPoses PointCloudMapper::CapturePoses() const
@@ -198,7 +254,7 @@ PointCloudMapper::CloudPoses PointCloudMapper::CapturePoses() const
         // already been fused, including while no new keyframes are arriving.
         KeyFrame* keyFrame = entry.keyFrame;
         if (!keyFrame || keyFrame->isBad() ||
-            keyFrame->GetMap() != map || entry.cameraCloud->empty())
+            keyFrame->GetMap() != map || entry.cameraCloud->samples.empty())
             continue;
 
         CloudPose pose;
@@ -228,19 +284,35 @@ bool PointCloudMapper::SamePoses(const CloudPoses& lhs, const CloudPoses& rhs)
     return true;
 }
 
-PointCloud::Ptr PointCloudMapper::BuildGlobalMap(const CloudPoses& poses)
+PointCloud::Ptr PointCloudMapper::BuildGlobalMap(const CloudPoses& poses) const
 {
+    if (mFusionMode != FusionMode::Concatenate)
+    {
+        DensePointCloudFusion fusion(mVoxelSize, mFusionMode == FusionMode::Kalman);
+        for (const auto& pose : poses)
+            fusion.AddKeyFrame(*pose.cameraCloud, pose.Twc);
+        return fusion.MakePointCloud();
+    }
+
     PointCloud::Ptr map(new PointCloud);
     std::size_t pointCount = 0;
     for (const auto& pose : poses)
-        pointCount += pose.cameraCloud->size();
+        pointCount += pose.cameraCloud->samples.size();
     map->reserve(pointCount);
 
-    PointCloud transformed;
     for (const auto& pose : poses)
     {
-        pcl::transformPointCloud(*pose.cameraCloud, transformed, pose.Twc);
-        *map += transformed;
+        const Eigen::Matrix3f rotation = pose.Twc.topLeftCorner<3, 3>();
+        const Eigen::Vector3f translation = pose.Twc.topRightCorner<3, 1>();
+        for (const DensePointSample& sample : pose.cameraCloud->samples)
+        {
+            PointT point;
+            point.getVector3fMap() = rotation * sample.position + translation;
+            point.b = sample.bgr[0];
+            point.g = sample.bgr[1];
+            point.r = sample.bgr[2];
+            map->push_back(point);
+        }
     }
     map->is_dense = false;
     return map;
@@ -344,31 +416,34 @@ bool PointCloudMapper::SaveMap(const std::string &filename) const
         return false;
     }
 
-    PointCloud voxelFiltered;
-    PointCloud statisticalFiltered;
+    PointCloud::ConstPtr filtered = globalMap;
 
     try
     {
-        pcl::VoxelGrid<PointT> voxelFilter;
-        voxelFilter.setLeafSize(0.01f, 0.01f, 0.01f);
-        voxelFilter.setInputCloud(globalMap);
-        voxelFilter.filter(voxelFiltered);
-        cout << "Voxel filtering: " << globalMap->size() << " -> "
-             << voxelFiltered.size() << " points." << endl;
-
-        if (voxelFiltered.empty())
+        if (mFusionMode == FusionMode::Concatenate)
         {
-            cerr << "Voxel filtering produced an empty point cloud." << endl;
-            return false;
+            auto voxelFiltered = pcl::make_shared<PointCloud>();
+            pcl::VoxelGrid<PointT> voxelFilter;
+            voxelFilter.setLeafSize(0.01f, 0.01f, 0.01f);
+            voxelFilter.setInputCloud(globalMap);
+            voxelFilter.filter(*voxelFiltered);
+            cout << "Voxel filtering: " << globalMap->size() << " -> "
+                 << voxelFiltered->size() << " points." << endl;
+            filtered = voxelFiltered;
         }
 
-        pcl::StatisticalOutlierRemoval<PointT> statisticalFilter;
-        statisticalFilter.setMeanK(100);
-        statisticalFilter.setStddevMulThresh(1.0);
-        statisticalFilter.setInputCloud(voxelFiltered.makeShared());
-        statisticalFilter.filter(statisticalFiltered);
-        cout << "Statistical filtering: " << voxelFiltered.size() << " -> "
-             << statisticalFiltered.size() << " points." << endl;
+        if (filtered->size() > 2)
+        {
+            auto statisticalFiltered = pcl::make_shared<PointCloud>();
+            pcl::StatisticalOutlierRemoval<PointT> statisticalFilter;
+            statisticalFilter.setMeanK(static_cast<int>(std::min<std::size_t>(100, filtered->size() - 1)));
+            statisticalFilter.setStddevMulThresh(1.0);
+            statisticalFilter.setInputCloud(filtered);
+            statisticalFilter.filter(*statisticalFiltered);
+            cout << "Statistical filtering: " << filtered->size() << " -> "
+                 << statisticalFiltered->size() << " points." << endl;
+            filtered = statisticalFiltered;
+        }
     }
     catch (const std::exception &e)
     {
@@ -376,13 +451,13 @@ bool PointCloudMapper::SaveMap(const std::string &filename) const
         return false;
     }
 
-    if (statisticalFiltered.empty())
+    if (filtered->empty())
     {
-        cerr << "Statistical filtering produced an empty point cloud." << endl;
+        cerr << "Point cloud filtering produced an empty point cloud." << endl;
         return false;
     }
 
-    const int result = pcl::io::savePCDFileBinary(filename, statisticalFiltered);
+    const int result = pcl::io::savePCDFileBinary(filename, *filtered);
     if (result < 0)
     {
         cerr << "Failed to save point cloud map to " << filename << endl;
@@ -390,6 +465,6 @@ bool PointCloudMapper::SaveMap(const std::string &filename) const
     }
 
     cout << "Point cloud map saved to " << filename << " ("
-         << statisticalFiltered.size() << " filtered points)." << endl;
+         << filtered->size() << " filtered points)." << endl;
     return true;
 }

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -21,10 +22,15 @@ using namespace std;
 typedef pcl::PointXYZRGB PointT;
 typedef pcl::PointCloud<PointT> PointCloud;
 
+struct DensePointCloudFrame;
+
 class PointCloudMapper
 {
 public:
-    PointCloudMapper();
+    enum class FusionMode { Concatenate, Voxel, Kalman };
+
+    explicit PointCloudMapper(FusionMode mode = FusionMode::Voxel, float voxelSize = 0.03f);
+    static std::unique_ptr<PointCloudMapper> FromSettings(const cv::FileStorage& settings);
 
     // Submit only after LocalMapping has accepted the keyframe into its map.
     void InsertKeyFrame(KeyFrame* kf, const cv::Mat& imRGB, const cv::Mat& imDepth);
@@ -54,26 +60,27 @@ private:
     struct KeyFrameCloud
     {
         KeyFrame* keyFrame = nullptr;
-        PointCloud::ConstPtr cameraCloud;
+        std::shared_ptr<const DensePointCloudFrame> cameraCloud;
     };
 
     struct CloudPose
     {
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
         KeyFrame* keyFrame = nullptr;
-        PointCloud::ConstPtr cameraCloud;
+        std::shared_ptr<const DensePointCloudFrame> cameraCloud;
         Eigen::Matrix4f Twc;
     };
     using CloudPoses = std::vector<CloudPose, Eigen::aligned_allocator<CloudPose>>;
 
-    PointCloud::Ptr GenerateCameraPointCloud(const KeyFrame* kf,
-                                            const cv::Mat& imRGB,
-                                            const cv::Mat& imDepth);
+    std::shared_ptr<const DensePointCloudFrame> GenerateCameraPointCloud(
+        const KeyFrame* kf, const cv::Mat& imRGB, const cv::Mat& imDepth);
     CloudPoses CapturePoses() const;
     static bool SamePoses(const CloudPoses& lhs, const CloudPoses& rhs);
-    static PointCloud::Ptr BuildGlobalMap(const CloudPoses& poses);
+    PointCloud::Ptr BuildGlobalMap(const CloudPoses& poses) const;
     void RebuildGlobalMap(bool force);
 
+    const FusionMode mFusionMode;
+    const float mVoxelSize;
     std::queue<KeyFrameInput> mqKeyFrames;
     std::mutex mQueueMutex;
     std::condition_variable mQueueUpdated;
